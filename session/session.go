@@ -69,6 +69,7 @@ type Session struct {
 	// Users should not access or modify this field directly.
 	ServiceMeta map[string]string `json:"-"`
 
+
 	// maskedEventIDs tracks events that have been soft-hidden from LLM context.
 	// Masked events remain in the Events slice for audit/debug purposes but
 	// are excluded from GetVisibleEvents(). This implements the Pensieve
