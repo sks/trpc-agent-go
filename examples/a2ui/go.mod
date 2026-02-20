@@ -1,29 +1,23 @@
-module trpc.group/trpc-go/trpc-agent-go/examples/a2ui
+module trpc.group/trpc-go/trpc-agent-go/benchmark/anthropic_skills/trpc-agent-go-impl
 
-go 1.24.4
+go 1.21
 
-replace (
-	trpc.group/trpc-go/trpc-agent-go => ../../
-	trpc.group/trpc-go/trpc-agent-go/server/agui => ../../server/agui
+require (
+	github.com/stretchr/testify v1.10.0
+	trpc.group/trpc-go/trpc-agent-go v1.2.0
 )
 
 require (
-	trpc.group/trpc-go/trpc-agent-go v1.7.0
-	trpc.group/trpc-go/trpc-agent-go/server/agui v1.7.0
-)
-
-require (
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260305114736-115a967b66a9 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.9.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/creack/pty v1.1.24 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/panjf2000/ants/v2 v2.10.0 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
@@ -49,3 +43,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	trpc.group/trpc-go/trpc-a2a-go v0.2.5 // indirect
 )
+
+replace trpc.group/trpc-go/trpc-agent-go => ../../..
