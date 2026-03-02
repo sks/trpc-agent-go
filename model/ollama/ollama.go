@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/ollama/ollama/api"
+
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
@@ -169,22 +169,18 @@ func (m *Model) GenerateContent(
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
 
-	// Execute callback synchronously before starting the goroutine
-	// to avoid a race where the runner and HTTP handler finish
-	// (closing the SSE writer) while the callback is still running.
-	if m.chatRequestCallback != nil {
-		m.chatRequestCallback(ctx, chatRequest)
-	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
-	responseID := newResponseID()
 	go func() {
 		defer close(responseChan)
+		if m.chatRequestCallback != nil {
+			m.chatRequestCallback(ctx, chatRequest)
+		}
 		if request.Stream {
-			m.handleStreamingResponse(ctx, *chatRequest, responseID, responseChan)
+			m.handleStreamingResponse(ctx, *chatRequest, responseChan)
 			return
 		}
-		m.handleNonStreamingResponse(ctx, *chatRequest, responseID, responseChan)
+		m.handleNonStreamingResponse(ctx, *chatRequest, responseChan)
 	}()
 	return responseChan, nil
 }
@@ -237,6 +233,50 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	}
 
 	request.Messages = tailored
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	if err != nil {
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
+		return
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	if request.GenerationConfig.MaxTokens == nil {
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				m.contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(m.contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			// Cap to model's known max output tokens if applicable.
+			if modelCap := imodel.ResolveMaxOutputTokens(m.name); modelCap > 0 && maxOutputTokens > modelCap {
+				maxOutputTokens = modelCap
+			}
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				m.contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
+	}
 }
 
 // buildChatRequest builds the chat request for the Ollama API.
@@ -295,7 +335,6 @@ func (m *Model) buildChatRequest(request *model.Request) (*api.ChatRequest, erro
 func (m *Model) handleNonStreamingResponse(
 	ctx context.Context,
 	chatRequest api.ChatRequest,
-	responseID string,
 	responseChan chan<- *model.Response,
 ) {
 	// Issue non-streaming request.
@@ -305,7 +344,7 @@ func (m *Model) handleNonStreamingResponse(
 		return nil
 	})
 	if err != nil {
-		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeAPIError, err)
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
 		return
 	}
 
@@ -313,9 +352,9 @@ func (m *Model) handleNonStreamingResponse(
 		m.chatResponseCallback(ctx, &chatRequest, &chatResponse)
 	}
 
-	response, err := convertChatResponse(chatResponse, responseID)
+	response, err := convertChatResponse(chatResponse)
 	if err != nil {
-		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeAPIError, err)
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
 		return
 	}
 
@@ -330,7 +369,6 @@ func (m *Model) handleNonStreamingResponse(
 func (m *Model) handleStreamingResponse(
 	ctx context.Context,
 	chatRequest api.ChatRequest,
-	responseID string,
 	responseChan chan<- *model.Response,
 ) {
 	var streamErr error
@@ -340,7 +378,7 @@ func (m *Model) handleStreamingResponse(
 			m.chatChunkCallback(ctx, &chatRequest, &chunk)
 		}
 
-		response, err := convertChatResponse(chunk, responseID)
+		response, err := convertChatResponse(chunk)
 		if err != nil {
 			return err
 		}
@@ -357,7 +395,7 @@ func (m *Model) handleStreamingResponse(
 
 	if err != nil {
 		streamErr = err
-		m.sendErrorResponse(ctx, responseChan, responseID, model.ErrorTypeStreamError, err)
+		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeStreamError, err)
 	}
 
 	// Call the stream complete callback.
@@ -367,15 +405,8 @@ func (m *Model) handleStreamingResponse(
 }
 
 // sendErrorResponse sends an error response through the channel.
-func (m *Model) sendErrorResponse(
-	ctx context.Context,
-	responseChan chan<- *model.Response,
-	responseID string,
-	errType string,
-	err error,
-) {
+func (m *Model) sendErrorResponse(ctx context.Context, responseChan chan<- *model.Response, errType string, err error) {
 	errorResponse := &model.Response{
-		ID: responseID,
 		Error: &model.ResponseError{
 			Message: err.Error(),
 			Type:    errType,
@@ -387,10 +418,6 @@ func (m *Model) sendErrorResponse(
 	case responseChan <- errorResponse:
 	case <-ctx.Done():
 	}
-}
-
-func newResponseID() string {
-	return "ollama-" + uuid.NewString()
 }
 
 // getContextWindow retrieves the context window size for the model.
@@ -477,7 +504,7 @@ func convertMessages(messages []model.Message) ([]api.Message, error) {
 	return result, nil
 }
 
-func convertChatResponse(resp api.ChatResponse, responseID string) (*model.Response, error) {
+func convertChatResponse(resp api.ChatResponse) (*model.Response, error) {
 	var toolCalls []model.ToolCall
 	for _, toolCall := range resp.Message.ToolCalls {
 		args, err := json.Marshal(toolCall.Function.Arguments)
@@ -523,7 +550,6 @@ func convertChatResponse(resp api.ChatResponse, responseID string) (*model.Respo
 	}
 	now := time.Now()
 	msg := &model.Response{
-		ID:        responseID,
 		Object:    obj,
 		Created:   now.Unix(),
 		Timestamp: now,

@@ -132,16 +132,13 @@ func (m *Model) GenerateContent(
 	if err != nil {
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
-	// Execute callback synchronously before starting the goroutine
-	// to avoid a race where the runner and HTTP handler finish
-	// (closing the SSE writer) while the callback is still running.
-	if m.chatRequestCallback != nil {
-		m.chatRequestCallback(ctx, chatRequest)
-	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
 		defer close(responseChan)
+		if m.chatRequestCallback != nil {
+			m.chatRequestCallback(ctx, chatRequest)
+		}
 		if request.Stream {
 			m.handleStreamingResponse(ctx, *chatRequest, responseChan)
 			return
@@ -200,6 +197,54 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	}
 
 	request.Messages = tailored
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	if err != nil {
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
+		return
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	// This respects user's explicit configuration while providing a safe default.
+	if request.GenerationConfig.MaxTokens == nil {
+		contextWindow := imodel.ResolveContextWindow(m.name)
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			// Cap to model's known max output tokens if applicable.
+			// Models like claude-sonnet-4 have a 200K context window but only
+			// support 128K max output tokens.
+			if modelCap := imodel.ResolveMaxOutputTokens(m.name); modelCap > 0 && maxOutputTokens > modelCap {
+				maxOutputTokens = modelCap
+			}
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
+	}
 }
 
 // buildChatRequest builds the chat request for the Anthropic API.
