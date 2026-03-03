@@ -32,6 +32,15 @@ const (
 	functionToolType         = "function"
 )
 
+var (
+	protocolOverheadTokens = imodel.DefaultProtocolOverheadTokens
+	reserveOutputTokens    = imodel.DefaultReserveOutputTokens
+	inputTokensFloor       = imodel.DefaultInputTokensFloor
+	outputTokensFloor      = imodel.DefaultOutputTokensFloor
+	safetyMarginRatio      = imodel.DefaultSafetyMarginRatio
+	maxInputTokensRatio    = imodel.DefaultMaxInputTokensRatio
+)
+
 // Model implements the model.Model interface for Hunyuan API.
 type Model struct {
 	client                     *hunyuan.Client
@@ -52,6 +61,7 @@ type Model struct {
 	protocolOverheadTokens int
 	reserveOutputTokens    int
 	inputTokensFloor       int
+	outputTokensFloor      int
 	safetyMarginRatio      float64
 	maxInputTokensRatio    float64
 }
@@ -165,6 +175,7 @@ func New(name string, opts ...Option) *Model {
 		protocolOverheadTokens:     o.tokenTailoringConfig.ProtocolOverheadTokens,
 		reserveOutputTokens:        o.tokenTailoringConfig.ReserveOutputTokens,
 		inputTokensFloor:           o.tokenTailoringConfig.InputTokensFloor,
+		outputTokensFloor:          o.tokenTailoringConfig.OutputTokensFloor,
 		safetyMarginRatio:          o.tokenTailoringConfig.SafetyMarginRatio,
 		maxInputTokensRatio:        o.tokenTailoringConfig.MaxInputTokensRatio,
 	}
@@ -199,16 +210,13 @@ func (m *Model) GenerateContent(
 		return nil, fmt.Errorf("build chat request: %w", err)
 	}
 
-	// Execute callback synchronously before starting the goroutine
-	// to avoid a race where the runner and HTTP handler finish
-	// (closing the SSE writer) while the callback is still running.
-	if m.chatRequestCallback != nil {
-		m.chatRequestCallback(ctx, chatRequest)
-	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
 		defer close(responseChan)
+		if m.chatRequestCallback != nil {
+			m.chatRequestCallback(ctx, chatRequest)
+		}
 		if request.Stream {
 			m.handleStreamingResponse(ctx, chatRequest, responseChan)
 			return
@@ -256,6 +264,40 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	}
 
 	request.Messages = tailored
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens := 0
+	if len(request.Messages) > 0 {
+		var err error
+		usedTokens, err = m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+		if err != nil {
+			log.WarnContext(ctx, "failed to count tokens after tailoring", "error", err)
+			return
+		}
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	if request.GenerationConfig.MaxTokens == nil {
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				m.contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(m.contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(ctx, "token tailoring: contextWindow=%d, usedTokens=%d, maxOutputTokens=%d",
+				m.contextWindow, usedTokens, maxOutputTokens)
+		}
+	}
 }
 
 // buildChatRequest builds the chat request for the Hunyuan API.
