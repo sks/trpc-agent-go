@@ -155,9 +155,13 @@ func NewNoteTool() tool.CallableTool {
 					UserID:    inv.Session.UserID,
 					SessionID: inv.Session.ID,
 				}
-				_ = inv.SessionService.UpdateSessionState(ctx, sessKey, session.StateMap{
+				if err := inv.SessionService.UpdateSessionState(ctx, sessKey, session.StateMap{
 					stateKey: stateValue,
-				})
+				}); err != nil {
+					return NoteOutput{
+						Message: fmt.Sprintf("note '%s' saved in-memory but failed to persist to DB: %v", input.Key, err),
+					}, nil
+				}
 			}
 
 			return NoteOutput{
