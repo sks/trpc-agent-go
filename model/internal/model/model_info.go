@@ -341,6 +341,39 @@ func ResolveMaxOutputTokens(modelName string) int {
 	return 0
 }
 
+// Default parameters for CalculateMaxOutputTokens.
+const (
+	defaultProtocolOverheadTokens = 512  // Reserved for tool/system framing tokens.
+	defaultOutputTokensFloor      = 1024 // Minimum output tokens guaranteed.
+	defaultSafetyMarginRatio      = 0.05 // 5% safety margin.
+)
+
+// CalculateMaxOutputTokens computes the max output tokens using default
+// parameters. It subtracts used tokens, protocol overhead, and a safety
+// margin from the context window, flooring at defaultOutputTokensFloor.
+func CalculateMaxOutputTokens(contextWindow, usedTokens int) int {
+	return CalculateMaxOutputTokensWithParams(
+		contextWindow,
+		usedTokens,
+		defaultProtocolOverheadTokens,
+		defaultOutputTokensFloor,
+		defaultSafetyMarginRatio,
+	)
+}
+
+// CalculateMaxOutputTokensWithParams computes the max output tokens with
+// explicit parameters for protocol overhead, output floor, and safety margin.
+func CalculateMaxOutputTokensWithParams(contextWindow, usedTokens, protocolOverheadTokens, outputTokensFloor int, safetyMarginRatio float64) int {
+	available := contextWindow - usedTokens - protocolOverheadTokens
+	safetyMargin := int(float64(contextWindow) * safetyMarginRatio)
+	available -= safetyMargin
+
+	if available < outputTokensFloor {
+		return outputTokensFloor
+	}
+	return available
+}
+
 // GetAllModelContextWindows returns a copy of all model context window mappings.
 // This is useful for debugging and testing.
 func GetAllModelContextWindows() map[string]int {
