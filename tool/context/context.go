@@ -74,7 +74,7 @@ func NewDeleteContextTool() tool.CallableTool {
 				}, nil
 			}
 
-			masked := sess.MaskEvents(input.EventIDs)
+			masked := sess.MaskEvents(input.EventIDs...)
 			return DeleteContextOutput{
 				Masked:  masked,
 				Message: fmt.Sprintf("masked %d events from context", masked),
