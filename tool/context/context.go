@@ -5,15 +5,11 @@
 //
 // trpc-agent-go is licensed under the Apache License Version 2.0.
 //
-
-// Package context provides tools for LLM self-context management.
 //
-// These tools implement the Pensieve paradigm (arXiv:2602.12108), enabling
-// language models to actively manage their own context window. Instead of
-// relying on external truncation, the model can:
-//   - Prune processed context via delete_context
-//   - Check remaining budget via check_budget
-//   - Maintain persistent notes via note / read_notes
+
+// Package context provides Pensieve-style context management tools that allow
+// LLMs to prune their own visible context. These tools implement the self-pruning
+// paradigm described in https://arxiv.org/abs/2602.12108.
 package context
 
 import (
@@ -28,11 +24,15 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
-// --- delete_context tool ---
+const (
+	DeleteContextTool = "context_delete_context"
+	CheckBudgetTool   = "context_check_budget"
+)
+
+const noteKeyPrefix = "note:"
 
 // DeleteContextInput is the input for the delete_context tool.
 type DeleteContextInput struct {
-	// EventIDs is the list of event IDs to mask (hide) from visible context.
 	EventIDs []string `json:"event_ids" jsonschema:"description=IDs of events to remove from visible context,required"`
 }
 
@@ -40,6 +40,16 @@ type DeleteContextInput struct {
 type DeleteContextOutput struct {
 	Masked  int    `json:"masked"`
 	Message string `json:"message"`
+}
+
+// CheckBudgetInput is the input for the check_budget tool (empty — no args needed).
+type CheckBudgetInput struct{}
+
+// CheckBudgetOutput is the output for the check_budget tool.
+type CheckBudgetOutput struct {
+	TotalEvents   int `json:"total_events"`
+	VisibleEvents int `json:"visible_events"`
+	MaskedEvents  int `json:"masked_events"`
 }
 
 // sessionFromContext retrieves the session from the invocation context.
@@ -53,8 +63,7 @@ func sessionFromContext(ctx context.Context) *session.Session {
 }
 
 // NewDeleteContextTool creates a tool that allows the LLM to prune specific
-// events from its visible context. Events are soft-masked (hidden from view
-// but preserved for audit). This is the Pensieve paradigm's "deleteContext".
+// events from its visible context.
 func NewDeleteContextTool() tool.CallableTool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, input DeleteContextInput) (DeleteContextOutput, error) {
@@ -65,13 +74,13 @@ func NewDeleteContextTool() tool.CallableTool {
 				}, nil
 			}
 
-			masked := sess.MaskEvents(input.EventIDs...)
+			masked := sess.MaskEvents(input.EventIDs)
 			return DeleteContextOutput{
 				Masked:  masked,
 				Message: fmt.Sprintf("masked %d events from context", masked),
 			}, nil
 		},
-		function.WithName("delete_context"),
+		function.WithName(DeleteContextTool),
 		function.WithDescription(
 			"Remove specific events from your visible context to free up space. "+
 				"Events are soft-hidden (preserved for audit) but no longer sent to the LLM. "+
@@ -81,20 +90,7 @@ func NewDeleteContextTool() tool.CallableTool {
 	)
 }
 
-// --- check_budget tool ---
-
-// CheckBudgetInput is the input for the check_budget tool (empty — no args needed).
-type CheckBudgetInput struct{}
-
-// CheckBudgetOutput is the output for the check_budget tool.
-type CheckBudgetOutput struct {
-	TotalEvents   int `json:"total_events"`
-	VisibleEvents int `json:"visible_events"`
-	MaskedEvents  int `json:"masked_events"`
-}
-
 // NewCheckBudgetTool creates a tool that reports the current context budget.
-// The LLM can query this to decide when to prune context.
 func NewCheckBudgetTool() tool.CallableTool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, _ CheckBudgetInput) (CheckBudgetOutput, error) {
@@ -112,7 +108,7 @@ func NewCheckBudgetTool() tool.CallableTool {
 				MaskedEvents:  masked,
 			}, nil
 		},
-		function.WithName("check_budget"),
+		function.WithName(CheckBudgetTool),
 		function.WithDescription(
 			"Check how much context budget remains. Returns the total number of events, "+
 				"visible events (sent to LLM), and masked events (hidden). "+
@@ -122,8 +118,6 @@ func NewCheckBudgetTool() tool.CallableTool {
 }
 
 // --- note / read_notes tools ---
-
-const noteKeyPrefix = "note:"
 
 // NoteInput is the input for the note tool.
 type NoteInput struct {
@@ -143,12 +137,29 @@ type NoteOutput struct {
 func NewNoteTool() tool.CallableTool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, input NoteInput) (NoteOutput, error) {
-			sess := sessionFromContext(ctx)
-			if sess == nil {
+			inv, ok := agent.InvocationFromContext(ctx)
+			if !ok || inv == nil || inv.Session == nil {
 				return NoteOutput{Message: "no session available"}, nil
 			}
 
-			sess.SetState(noteKeyPrefix+input.Key, []byte(input.Content))
+			stateKey := noteKeyPrefix + input.Key
+			stateValue := []byte(input.Content)
+
+			// Write to in-memory session state.
+			inv.Session.SetState(stateKey, stateValue)
+
+			// Persist to DB-backed session service if available.
+			if inv.SessionService != nil {
+				sessKey := session.Key{
+					AppName:   inv.Session.AppName,
+					UserID:    inv.Session.UserID,
+					SessionID: inv.Session.ID,
+				}
+				_ = inv.SessionService.UpdateSessionState(ctx, sessKey, session.StateMap{
+					stateKey: stateValue,
+				})
+			}
+
 			return NoteOutput{
 				Message: fmt.Sprintf("note '%s' saved (%d bytes)", input.Key, len(input.Content)),
 			}, nil
@@ -160,6 +171,7 @@ func NewNoteTool() tool.CallableTool {
 				"before removing raw context via delete_context. "+
 				"Notes are stored by key and can be overwritten.",
 		),
+		function.WithSkipSummarization(true),
 	)
 }
 
@@ -173,7 +185,6 @@ type ReadNotesOutput struct {
 }
 
 // NewReadNotesTool creates a tool that lists all persistent notes.
-// The LLM uses this to recall distilled information after pruning context.
 func NewReadNotesTool() tool.CallableTool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, _ ReadNotesInput) (ReadNotesOutput, error) {
@@ -190,7 +201,6 @@ func NewReadNotesTool() tool.CallableTool {
 				}
 			}
 
-			// Sort keys for deterministic output.
 			keys := make([]string, 0, len(notes))
 			for k := range notes {
 				keys = append(keys, k)
@@ -208,6 +218,7 @@ func NewReadNotesTool() tool.CallableTool {
 				"Returns a map of key→content. Use this to recall distilled "+
 				"information after pruning raw context.",
 		),
+		function.WithSkipSummarization(true),
 	)
 }
 
