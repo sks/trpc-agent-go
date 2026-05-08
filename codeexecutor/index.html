@@ -789,9 +789,9 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#default-behavior-of-withcodeexecutor" class="md-nav__link">
+  <a href="#withcodeexecutor-vs-fenced-code-auto-execution" class="md-nav__link">
     <span class="md-ellipsis">
-      Default Behavior of WithCodeExecutor
+      WithCodeExecutor vs fenced-code auto-execution
     </span>
   </a>
   
@@ -868,6 +868,30 @@
       How Tools Usually Use These Files
     </span>
   </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workspace-init-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      Workspace init hooks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Workspace init hooks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#interaction-with-skill_load" class="md-nav__link">
+    <span class="md-ellipsis">
+      Interaction with skill_load
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1942,6 +1966,29 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../promptiter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    PromptIter
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2019,9 +2066,23 @@
   
   
   
-    <li class="md-nav__item">
-      <a href="../agui/" class="md-nav__link">
+    
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
         
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_2" id="__nav_3_2_label" tabindex="0">
+            
   
   
   <span class="md-ellipsis">
@@ -2030,7 +2091,111 @@
   </span>
   
 
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_2">
+            <span class="md-nav__icon md-icon"></span>
+            AG-UI
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agui/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Overview
+    
+  </span>
+  
+
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agui/chat/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Real-Time Conversation Route
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agui/history/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Messages Snapshot Route
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agui/cancel/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Cancel Route
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
     </li>
   
 
@@ -2179,9 +2344,9 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#default-behavior-of-withcodeexecutor" class="md-nav__link">
+  <a href="#withcodeexecutor-vs-fenced-code-auto-execution" class="md-nav__link">
     <span class="md-ellipsis">
-      Default Behavior of WithCodeExecutor
+      WithCodeExecutor vs fenced-code auto-execution
     </span>
   </a>
   
@@ -2258,6 +2423,30 @@
       How Tools Usually Use These Files
     </span>
   </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#workspace-init-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      Workspace init hooks
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Workspace init hooks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#interaction-with-skill_load" class="md-nav__link">
+    <span class="md-ellipsis">
+      Interaction with skill_load
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2459,16 +2648,30 @@ file handling, this layer is usually unnecessary.</p>
 </span></code></pre></div></td></tr></table></div>
 <p>More complete examples:</p>
 <ul>
-<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/main.go">examples/codeexecution/main.go</a></li>
-<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/jupyter/README.md">examples/codeexecution/jupyter/README.md</a></li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/main.go">examples/codeexecution/main.go</a> (local backend)</li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/container/README.md">examples/codeexecution/container/README.md</a> (Docker container backend)</li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/jupyter/README.md">examples/codeexecution/jupyter/README.md</a> (Jupyter kernel backend)</li>
 </ul>
-<h3 id="default-behavior-of-withcodeexecutor">Default Behavior of <code>WithCodeExecutor</code></h3>
-<p><code>llmagent.WithCodeExecutor(...)</code> does more than provide a runtime.</p>
-<p>By default, it also enables the response-side code execution processor. If the
-assistant reply is exactly one runnable fenced code block, the framework will
-extract and execute that block automatically.</p>
-<p>If you only want workspace support, <code>workspace_exec</code>, or other executor-backed
-tools, and do not want model output code blocks to auto-run, disable it:</p>
+<h3 id="withcodeexecutor-vs-fenced-code-auto-execution"><code>WithCodeExecutor</code> vs fenced-code auto-execution</h3>
+<p><code>llmagent.WithCodeExecutor(...)</code> and the response-side fenced-code
+auto-execution processor are <strong>two independent switches</strong>. Understanding
+this distinction early avoids a common point of confusion: treating them
+as a single switch.</p>
+<ul>
+<li><code>WithCodeExecutor(...)</code> supplies a <em>runtime</em> that execution-backed
+  tools — most notably <code>workspace_exec</code> — use to run commands. It does
+  not, by itself, cause anything to be executed from the assistant's
+  reply.</li>
+<li><code>EnableCodeExecutionResponseProcessor</code> (default: <code>true</code>, toggled via
+  <code>WithEnableCodeExecutionResponseProcessor(enable bool)</code>) controls
+  whether the framework scans the assistant reply and, if it is exactly
+  one runnable fenced code block, runs that block automatically.</li>
+</ul>
+<p>Auto-execution of fenced code actually fires only when <em>both</em> are true:
+an executor is available <strong>and</strong> the response processor is enabled.</p>
+<p>If you only want the executor to power <code>workspace_exec</code> or other
+tool-backed execution paths, and do not want assistant replies to be
+auto-executed, opt out of the response-side processor explicitly:</p>
 <div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span>
 <span class="normal"><a href="#__codelineno-1-2">2</a></span>
 <span class="normal"><a href="#__codelineno-1-3">3</a></span>
@@ -2481,12 +2684,20 @@ tools, and do not want model output code blocks to auto-run, disable it:</p>
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="w">    </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithEnableCodeExecutionResponseProcessor</span><span class="p">(</span><span class="kc">false</span><span class="p">),</span>
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
-<p>Common cases for disabling auto-execution:</p>
+<p>Common cases for disabling fenced-code auto-execution:</p>
 <ul>
 <li>using <code>workspace_exec</code> only</li>
 <li>providing a runtime for other tools</li>
 <li>requiring code execution to happen only through explicit tool calls</li>
 </ul>
+<p>Interaction with <code>WithSkills(repo)</code> auto-fallback: when the skills
+layer implicitly injects a local <code>CodeExecutor</code> on your behalf (see the
+Agent Skills guide), that implicit executor is treated as "only here to
+power <code>workspace_exec</code>". In that case the framework automatically sets
+<code>EnableCodeExecutionResponseProcessor=false</code> unless you explicitly
+called <code>WithEnableCodeExecutionResponseProcessor(...)</code> yourself. Using
+<code>WithCodeExecutor(...)</code> explicitly, by contrast, leaves the switch at
+its framework default so your existing behavior is preserved.</p>
 <h2 id="choosing-a-backend">Choosing a Backend</h2>
 <p>Common backends:</p>
 <ul>
@@ -2734,6 +2945,105 @@ flow is:</p>
 </ol>
 <p>This keeps the contract simple: tools and models rely on stable paths instead
 of dealing with staging internals.</p>
+<h2 id="workspace-init-hooks">Workspace init hooks</h2>
+<p>Hooks run <strong>after</strong> <code>WorkspaceManager.CreateWorkspace</code> succeeds and <strong>before</strong> that <code>Workspace</code> is returned to callers. When the app uses a <code>WorkspaceRegistry</code> (the default for session-scoped tools), creation runs <strong>once per logical workspace id</strong>—usually once per agent session workspace. Trusted-local modes may reuse one physical directory across sessions; hooks may still run whenever a distinct workspace acquisition happens. Do not assume hooks run at most once per on-disk path: re-acquisition can run them again.</p>
+<p>Use init hooks to stage fixed inputs (<code>InputSpec</code>: <code>artifact://</code>, <code>host://</code>, etc.) and run deterministic setup commands (for example <code>pip install</code> inside a shell one-liner).</p>
+<p>Artifact-backed inputs require the artifact service and (when applicable)
+session fields on <code>context</code> when <code>CreateWorkspace</code> runs—the same requirements as
+<code>WorkspaceFS.StageInputs</code>. Standard llmagent workspace tools inject this from the
+current <code>agent.Invocation</code> when resolving the session workspace, so the example
+below works without manual context wiring.</p>
+<div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-6-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-6-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-6-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-6-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-6-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-6-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-6-10">10</a></span>
+<span class="normal"><a href="#__codelineno-6-11">11</a></span>
+<span class="normal"><a href="#__codelineno-6-12">12</a></span>
+<span class="normal"><a href="#__codelineno-6-13">13</a></span>
+<span class="normal"><a href="#__codelineno-6-14">14</a></span>
+<span class="normal"><a href="#__codelineno-6-15">15</a></span>
+<span class="normal"><a href="#__codelineno-6-16">16</a></span>
+<span class="normal"><a href="#__codelineno-6-17">17</a></span>
+<span class="normal"><a href="#__codelineno-6-18">18</a></span>
+<span class="normal"><a href="#__codelineno-6-19">19</a></span>
+<span class="normal"><a href="#__codelineno-6-20">20</a></span>
+<span class="normal"><a href="#__codelineno-6-21">21</a></span>
+<span class="normal"><a href="#__codelineno-6-22">22</a></span>
+<span class="normal"><a href="#__codelineno-6-23">23</a></span>
+<span class="normal"><a href="#__codelineno-6-24">24</a></span>
+<span class="normal"><a href="#__codelineno-6-25">25</a></span>
+<span class="normal"><a href="#__codelineno-6-26">26</a></span>
+<span class="normal"><a href="#__codelineno-6-27">27</a></span>
+<span class="normal"><a href="#__codelineno-6-28">28</a></span>
+<span class="normal"><a href="#__codelineno-6-29">29</a></span>
+<span class="normal"><a href="#__codelineno-6-30">30</a></span>
+<span class="normal"><a href="#__codelineno-6-31">31</a></span>
+<span class="normal"><a href="#__codelineno-6-32">32</a></span>
+<span class="normal"><a href="#__codelineno-6-33">33</a></span>
+<span class="normal"><a href="#__codelineno-6-34">34</a></span>
+<span class="normal"><a href="#__codelineno-6-35">35</a></span>
+<span class="normal"><a href="#__codelineno-6-36">36</a></span>
+<span class="normal"><a href="#__codelineno-6-37">37</a></span>
+<span class="normal"><a href="#__codelineno-6-38">38</a></span>
+<span class="normal"><a href="#__codelineno-6-39">39</a></span>
+<span class="normal"><a href="#__codelineno-6-40">40</a></span>
+<span class="normal"><a href="#__codelineno-6-41">41</a></span>
+<span class="normal"><a href="#__codelineno-6-42">42</a></span></pre></div></td><td class="code"><div><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="w">    </span><span class="s">&quot;fmt&quot;</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="w">    </span><span class="s">&quot;time&quot;</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4"></a>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/agent/llmagent&quot;</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/codeexecutor&quot;</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="w">    </span><span class="s">&quot;trpc.group/trpc-go/trpc-agent-go/codeexecutor/local&quot;</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8"></a><span class="p">)</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9"></a>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="kd">func</span><span class="w"> </span><span class="nx">newAnalystAgent</span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">LLMAgent</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="w">    </span><span class="nx">exec</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">codeexecutor</span><span class="p">.</span><span class="nx">NewWorkspaceInitExecutor</span><span class="p">(</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12"></a><span class="w">        </span><span class="nx">local</span><span class="p">.</span><span class="nx">New</span><span class="p">(),</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13"></a><span class="w">        </span><span class="nx">codeexecutor</span><span class="p">.</span><span class="nx">NewWorkspaceInitHook</span><span class="p">(</span><span class="nx">codeexecutor</span><span class="p">.</span><span class="nx">WorkspaceInitSpec</span><span class="p">{</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14"></a><span class="w">            </span><span class="nx">Inputs</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span><span class="nx">codeexecutor</span><span class="p">.</span><span class="nx">InputSpec</span><span class="p">{</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15"></a><span class="w">                </span><span class="p">{</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16"></a><span class="w">                    </span><span class="nx">From</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;artifact://app/requirements.txt@3&quot;</span><span class="p">,</span>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17"></a><span class="w">                    </span><span class="nx">To</span><span class="p">:</span><span class="w">   </span><span class="s">&quot;work/requirements.txt&quot;</span><span class="p">,</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18"></a><span class="w">                    </span><span class="nx">Mode</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;copy&quot;</span><span class="p">,</span>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19"></a><span class="w">                </span><span class="p">},</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20"></a><span class="w">            </span><span class="p">},</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21"></a><span class="w">            </span><span class="nx">Commands</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span><span class="nx">codeexecutor</span><span class="p">.</span><span class="nx">WorkspaceInitCommand</span><span class="p">{</span>
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22"></a><span class="w">                </span><span class="p">{</span>
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23"></a><span class="w">                    </span><span class="nx">Name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;install-deps&quot;</span><span class="p">,</span>
+</span><span id="__span-6-24"><a id="__codelineno-6-24" name="__codelineno-6-24"></a><span class="w">                    </span><span class="nx">Cmd</span><span class="p">:</span><span class="w">  </span><span class="s">&quot;bash&quot;</span><span class="p">,</span>
+</span><span id="__span-6-25"><a id="__codelineno-6-25" name="__codelineno-6-25"></a><span class="w">                    </span><span class="nx">Args</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span><span class="kt">string</span><span class="p">{</span>
+</span><span id="__span-6-26"><a id="__codelineno-6-26" name="__codelineno-6-26"></a><span class="w">                        </span><span class="s">&quot;-lc&quot;</span><span class="p">,</span>
+</span><span id="__span-6-27"><a id="__codelineno-6-27" name="__codelineno-6-27"></a><span class="w">                        </span><span class="s">&quot;python3 -m venv .venv &amp;&amp; &quot;</span><span class="w"> </span><span class="o">+</span>
+</span><span id="__span-6-28"><a id="__codelineno-6-28" name="__codelineno-6-28"></a><span class="w">                            </span><span class="s">&quot;.venv/bin/pip install -q -r work/requirements.txt&quot;</span><span class="p">,</span>
+</span><span id="__span-6-29"><a id="__codelineno-6-29" name="__codelineno-6-29"></a><span class="w">                    </span><span class="p">},</span>
+</span><span id="__span-6-30"><a id="__codelineno-6-30" name="__codelineno-6-30"></a><span class="w">                    </span><span class="nx">Timeout</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Minute</span><span class="p">,</span>
+</span><span id="__span-6-31"><a id="__codelineno-6-31" name="__codelineno-6-31"></a><span class="w">                </span><span class="p">},</span>
+</span><span id="__span-6-32"><a id="__codelineno-6-32" name="__codelineno-6-32"></a><span class="w">            </span><span class="p">},</span>
+</span><span id="__span-6-33"><a id="__codelineno-6-33" name="__codelineno-6-33"></a><span class="w">        </span><span class="p">}),</span>
+</span><span id="__span-6-34"><a id="__codelineno-6-34" name="__codelineno-6-34"></a><span class="w">    </span><span class="p">)</span>
+</span><span id="__span-6-35"><a id="__codelineno-6-35" name="__codelineno-6-35"></a><span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-36"><a id="__codelineno-6-36" name="__codelineno-6-36"></a><span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span><span class="p">,</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Errorf</span><span class="p">(</span><span class="s">&quot;workspace init executor: %w&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="p">)</span>
+</span><span id="__span-6-37"><a id="__codelineno-6-37" name="__codelineno-6-37"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-6-38"><a id="__codelineno-6-38" name="__codelineno-6-38"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span>
+</span><span id="__span-6-39"><a id="__codelineno-6-39" name="__codelineno-6-39"></a><span class="w">        </span><span class="s">&quot;analyst&quot;</span><span class="p">,</span>
+</span><span id="__span-6-40"><a id="__codelineno-6-40" name="__codelineno-6-40"></a><span class="w">        </span><span class="nx">llmagent</span><span class="p">.</span><span class="nx">WithCodeExecutor</span><span class="p">(</span><span class="nx">exec</span><span class="p">),</span>
+</span><span id="__span-6-41"><a id="__codelineno-6-41" name="__codelineno-6-41"></a><span class="w">    </span><span class="p">),</span><span class="w"> </span><span class="kc">nil</span>
+</span><span id="__span-6-42"><a id="__codelineno-6-42" name="__codelineno-6-42"></a><span class="p">}</span>
+</span></code></pre></div></td></tr></table></div>
+<p>If init inputs change later, use a <strong>new</strong> logical workspace (for example a new session id) or run setup again yourself; hooks do not watch files for you.</p>
+<h3 id="interaction-with-skill_load">Interaction with <code>skill_load</code></h3>
+<p>Skills loaded via <code>skill_load</code> are materialized into <code>skills/&lt;name&gt;</code> when
+<code>workspace_exec</code> runs, using the current session’s loaded skills. You do not
+need to duplicate skill sources in init hook <code>Inputs</code>; init hooks cover
+session-independent files and setup commands you want present before any tool
+run.</p>
 <h2 id="what-persists-across-turns">What Persists Across Turns</h2>
 <p>There are two important cases:</p>
 <ul>
@@ -2802,8 +3112,9 @@ exposes it depends on the higher-level Agent and tool wiring.</p>
 <h2 id="references">References</h2>
 <ul>
 <li>Examples:<ul>
-<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/main.go">examples/codeexecution/main.go</a></li>
-<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/jupyter/README.md">examples/codeexecution/jupyter/README.md</a></li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/main.go">examples/codeexecution/main.go</a> (local backend)</li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/container/README.md">examples/codeexecution/container/README.md</a> (Docker container backend)</li>
+<li><a href="https://github.com/trpc-group/trpc-agent-go/blob/main/examples/codeexecution/jupyter/README.md">examples/codeexecution/jupyter/README.md</a> (Jupyter kernel backend)</li>
 </ul>
 </li>
 <li>Related docs:<ul>
@@ -2833,7 +3144,7 @@ exposes it depends on the higher-level Agent and tool wiring.</p>
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="April 15, 2026 02:53:18 UTC">2026-04-15 02:53:18</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="April 28, 2026 10:04:00 UTC">2026-04-28 10:04:00</span>
   </span>
 
     
