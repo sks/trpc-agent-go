@@ -50,6 +50,35 @@ func TestFunctionTool_Run_Success(t *testing.T) {
 	}
 }
 
+func TestFunctionTool_EmptyInputArgs(t *testing.T) {
+	type emptyInput struct{}
+	type emptyOutput struct {
+		OK bool `json:"ok"`
+	}
+	fn := func(_ context.Context, _ emptyInput) (emptyOutput, error) {
+		return emptyOutput{OK: true}, nil
+	}
+	fTool := function.NewFunctionTool(fn,
+		function.WithName("EmptyInputTool"),
+		function.WithDescription("No-arg tool"))
+
+	for name, args := range map[string][]byte{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result, err := fTool.Call(context.Background(), args)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			out, ok := result.(emptyOutput)
+			if !ok || !out.OK {
+				t.Fatalf("expected ok result, got %T %v", result, result)
+			}
+		})
+	}
+}
+
 // Helper function to create Arguments from any struct.
 func toArguments(t *testing.T, v any) json.RawMessage {
 	t.Helper()
@@ -341,11 +370,53 @@ func TestFunctionTool_Call_UnmarshalError(t *testing.T) {
 
 	fTool := function.NewFunctionTool(fn, function.WithName("TestTool"))
 
-	// Invalid JSON
+	// Truly unrecoverable JSON still fails.
 	invalidJSON := []byte(`{invalid json}`)
 	_, err := fTool.Call(context.Background(), invalidJSON)
 	if err == nil {
 		t.Error("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestFunctionTool_Call_RejectsLeadingProse(t *testing.T) {
+	type inputArgs struct {
+		A int `json:"a"`
+	}
+	fn := func(_ context.Context, args inputArgs) (inputArgs, error) {
+		return args, nil
+	}
+	fTool := function.NewFunctionTool(fn, function.WithName("TestTool"))
+
+	_, err := fTool.Call(context.Background(), []byte(`Summary: {"a":1}`))
+	if err == nil {
+		t.Fatal("expected error for leading prose before JSON, got nil")
+	}
+}
+
+func TestFunctionTool_Call_RepairsMalformedJSON(t *testing.T) {
+	type inputArgs struct {
+		A int `json:"a"`
+	}
+	type outputArgs struct {
+		Result int `json:"result"`
+	}
+
+	fn := func(_ context.Context, args inputArgs) (outputArgs, error) {
+		return outputArgs{Result: args.A}, nil
+	}
+
+	fTool := function.NewFunctionTool(fn, function.WithName("TestTool"))
+
+	got, err := fTool.Call(context.Background(), []byte(`{a:1}`))
+	if err != nil {
+		t.Fatalf("expected repaired malformed JSON to succeed, got %v", err)
+	}
+	out, ok := got.(outputArgs)
+	if !ok {
+		t.Fatalf("expected outputArgs, got %T", got)
+	}
+	if out.Result != 1 {
+		t.Fatalf("expected result 1, got %d", out.Result)
 	}
 }
 
