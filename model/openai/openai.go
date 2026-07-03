@@ -663,7 +663,61 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	modeltailoring.ApplyResult(ctx, "openai.Model", request, tailored)
+	if !modeltailoring.ApplyResult(ctx, "openai.Model", request, tailored) {
+		return
+	}
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens := 0
+	if len(request.Messages) > 0 {
+		var err error
+		usedTokens, err = m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+		if err != nil {
+			log.WarnContext(
+				ctx,
+				"failed to count tokens after tailoring",
+				err,
+			)
+			return
+		}
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	// This respects user's explicit configuration while providing a safe default.
+	if request.GenerationConfig.MaxTokens == nil {
+		contextWindow := imodel.ResolveContextWindow(m.name)
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			// Cap to model's known max output tokens if applicable.
+			// Models like gpt-5.2 have a 400K context window but only
+			// support 128K max completion tokens.
+			if modelCap := imodel.ResolveMaxOutputTokens(m.name); modelCap > 0 && maxOutputTokens > modelCap {
+				maxOutputTokens = modelCap
+			}
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
+	}
 }
 
 func (m *Model) effectiveOutputReserveTokens(request *model.Request) int {
@@ -762,8 +816,8 @@ func (m *Model) buildChatRequest(request *model.Request) (*openai.ChatCompletion
 
 	// MaxTokens is deprecated and not compatible with o-series models.
 	// Use MaxCompletionTokens instead.
-	if request.MaxTokens != nil {
-		chatRequest.MaxCompletionTokens = openai.Int(int64(*request.MaxTokens))
+	if mt := model.SanitizeMaxTokensPtr(request.MaxTokens); mt != nil {
+		chatRequest.MaxCompletionTokens = openai.Int(int64(*mt))
 	}
 	if request.Temperature != nil {
 		chatRequest.Temperature = openai.Float(*request.Temperature)
@@ -1333,7 +1387,11 @@ func imageToURLOrBase64(image *model.Image) string {
 	if image.URL != "" {
 		return image.URL
 	}
-	return "data:image/" + image.Format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+	format := image.Format
+	if strings.HasPrefix(format, "image/") {
+		return "data:" + format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
+	}
+	return "data:image/" + format + ";base64," + base64.StdEncoding.EncodeToString(image.Data)
 }
 
 func isProviderFileID(fileID string) bool {

@@ -535,8 +535,98 @@ var ModelContextWindows = map[string]int{
 	"minimax-m2":             204800,
 }
 
-// LookupContextWindow returns a known context window size for a given
-// model name.
+// ModelMaxOutputTokens holds known model name -> max output token mappings.
+// Models whose max completion tokens is lower than their context window need
+// an explicit cap here so the token tailoring doesn't request more output
+// tokens than the API allows.
+var ModelMaxOutputTokens = map[string]int{
+	// OpenAI GPT-5.2 family: 400K context window but 128K max completion tokens.
+	"gpt-5.2":           128000,
+	"gpt-5.2-instant":   128000,
+	"gpt-5.2-codex-max": 128000,
+	"gpt-5.2-mini":      128000,
+	"gpt-5.2-nano":      128000,
+
+	// OpenAI GPT-5.1 family: same 128K cap.
+	"gpt-5.1":           128000,
+	"gpt-5.1-instant":   128000,
+	"gpt-5.1-codex-max": 128000,
+	"gpt-5.1-mini":      128000,
+	"gpt-5.1-nano":      128000,
+
+	// OpenAI GPT-5 family.
+	"gpt-5":      128000,
+	"gpt-5-mini": 128000,
+	"gpt-5-nano": 128000,
+
+	// OpenAI GPT-4.1 family: 1M context but 32K max output.
+	"gpt-4.1":      32768,
+	"gpt-4.1-mini": 32768,
+	"gpt-4.1-nano": 32768,
+
+	// OpenAI GPT-4.5
+	"gpt-4.5-preview": 16384,
+
+	// OpenAI GPT-4o family: 128K/200K context but 16K max completion tokens.
+	"gpt-4o":      16384,
+	"gpt-4o-mini": 16384,
+
+	// OpenAI GPT-4 Turbo: 128K context but 4K max output.
+	"gpt-4-turbo": 4096,
+
+	// OpenAI O-series: 200K context but 100K max output.
+	"o1":      100000,
+	"o1-mini": 65536,
+	"o3":      100000,
+	"o3-mini": 100000,
+	"o4-mini": 100000,
+
+	// Claude models: 200K context but 64K max output.
+	"claude-4.5-opus":   64000,
+	"claude-4.5-sonnet": 64000,
+	"claude-4.5-haiku":  64000,
+	"claude-4-opus":     64000,
+	"claude-opus-4":     64000,
+	"claude-sonnet-4":   64000,
+	"claude-4-sonnet":   64000,
+	"claude-3-7-sonnet": 64000,
+	"claude-3-5-sonnet": 8192,
+	"claude-3-5-haiku":  8192,
+	"claude-3-opus":     4096,
+	"claude-3-sonnet":   4096,
+	"claude-3-haiku":    4096,
+
+	// Gemini models: very large context but capped output.
+	"gemini-3.0-pro":   65536,
+	"gemini-3.0-flash": 65536,
+	"gemini-2.5-pro":   65536,
+	"gemini-2.5-flash": 65536,
+	"gemini-2.0-flash": 8192,
+	"gemini-1.5-pro":   8192,
+	"gemini-1.5-flash": 8192,
+}
+
+// isModelPrefixMatch reports whether modelName matches prefix at a model-ID boundary:
+// exact match, or modelName equals prefix followed by '-', '@', or ':' and more characters.
+func isModelPrefixMatch(modelName, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	if !strings.HasPrefix(modelName, prefix) {
+		return false
+	}
+	if len(modelName) == len(prefix) {
+		return true
+	}
+	switch modelName[len(prefix)] {
+	case '-', '@', ':':
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolveContextWindow returns the context window size for a given model name.
 // - Exact match (case-insensitive) first
 // - Prefix-based fallback second at a model-ID boundary
 // - Returns ok=false when the model is unknown
@@ -581,21 +671,27 @@ func ResolveContextWindow(modelName string) int {
 	return defaultContextWindow
 }
 
-// isModelPrefixMatch reports whether prefix matches a full model name or is
-// followed by a separator used by common snapshot/provider suffixes.
-func isModelPrefixMatch(modelName, prefix string) bool {
-	if !strings.HasPrefix(modelName, prefix) {
-		return false
+// ResolveMaxOutputTokens returns the max output tokens for a given model name.
+// Returns 0 if no explicit cap is known (caller should use its computed value).
+func ResolveMaxOutputTokens(modelName string) int {
+	if modelName == "" {
+		return 0
 	}
-	if len(modelName) == len(prefix) {
-		return true
+
+	ModelMutex.RLock()
+	defer ModelMutex.RUnlock()
+
+	key := strings.ToLower(modelName)
+	if w, ok := ModelMaxOutputTokens[key]; ok {
+		return w
 	}
-	switch modelName[len(prefix)] {
-	case '-', '@', ':':
-		return true
-	default:
-		return false
+	// Simple prefix heuristic.
+	for k, w := range ModelMaxOutputTokens {
+		if strings.HasPrefix(key, k) {
+			return w
+		}
 	}
+	return 0
 }
 
 // GetAllModelContextWindows returns a copy of all model context window mappings.

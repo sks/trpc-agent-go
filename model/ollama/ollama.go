@@ -308,7 +308,57 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	modeltailoring.ApplyResult(ctx, "ollama.Model", request, tailored)
+	if !modeltailoring.ApplyResult(ctx, "ollama.Model", request, tailored) {
+		return
+	}
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens := 0
+	if len(request.Messages) > 0 {
+		var err error
+		usedTokens, err = m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+		if err != nil {
+			log.WarnContext(
+				ctx,
+				"failed to count tokens after tailoring",
+				err,
+			)
+			return
+		}
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	if request.GenerationConfig.MaxTokens == nil {
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				m.contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(m.contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			// Cap to model's known max output tokens if applicable.
+			if modelCap := imodel.ResolveMaxOutputTokens(m.name); modelCap > 0 && maxOutputTokens > modelCap {
+				maxOutputTokens = modelCap
+			}
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				m.contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
+	}
 }
 
 // buildChatRequest builds the chat request for the Ollama API.
@@ -346,8 +396,8 @@ func (m *Model) buildChatRequest(request *model.Request) (*api.ChatRequest, erro
 	if len(request.Stop) > 0 {
 		chatRequest.Options["stop"] = request.Stop
 	}
-	if request.MaxTokens != nil {
-		chatRequest.Options["num_predict"] = *request.MaxTokens
+	if mt := model.SanitizeMaxTokensPtr(request.MaxTokens); mt != nil {
+		chatRequest.Options["num_predict"] = *mt
 	}
 	if request.ThinkingEnabled != nil {
 		chatRequest.Think = &api.ThinkValue{
