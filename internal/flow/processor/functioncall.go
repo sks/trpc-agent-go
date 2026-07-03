@@ -2775,7 +2775,7 @@ func convertToolArguments(originalName string, originalArgs []byte, targetName s
 
 	var input subAgentCall
 	if len(originalArgs) > 0 {
-		if err := jsonutils.DecodeFlexibleJSON(string(originalArgs), &input); err != nil {
+		if err := jsonutils.DecodeLeadingJSON(string(originalArgs), &input); err != nil {
 			log.Warnf("Failed to unmarshal sub-agent call arguments for %s: %v", originalName, err)
 			return nil
 		}

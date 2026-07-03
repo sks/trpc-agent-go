@@ -63,12 +63,16 @@ func DecodeFlexibleJSON(raw string, dest any) error {
 	if raw == "" {
 		return fmt.Errorf("empty JSON input")
 	}
-	if err := decodeWithRepair(raw, dest); err == nil {
+	err := decodeWithRepair(raw, dest)
+	if err == nil {
 		return nil
 	}
 	start := strings.IndexAny(raw, "{[")
 	if start < 0 {
 		return fmt.Errorf("no JSON value found")
+	}
+	if start == 0 {
+		return err
 	}
 	return decodeWithRepair(raw[start:], dest)
 }

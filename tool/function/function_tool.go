@@ -354,5 +354,5 @@ func normalizeJSONArgs(jsonArgs []byte) []byte {
 // Unmarshal unmarshals JSON tool arguments with repair when the payload is malformed.
 // Valid JSON is decoded strictly without calling jsonrepair.
 func (j *jsonUnmarshaler) Unmarshal(data []byte, v any) error {
-	return jsonutils.DecodeFlexibleJSON(string(data), v)
+	return jsonutils.DecodeLeadingJSON(string(data), v)
 }

@@ -21,8 +21,9 @@ type LoadResult struct {
 }
 
 // Loads parses s as JSON into a Go value using encoding/json.
-// Valid JSON is unmarshaled directly without calling Repair.
-// For LLM output that may be malformed, use LoadsRepair instead.
+// Valid JSON is unmarshaled directly without calling Repair; malformed input
+// is repaired automatically. Use LoadsRepair when the caller needs to know
+// whether repair was applied.
 func Loads(s string) (any, error) {
 	result, err := LoadsRepair(s)
 	if err != nil {

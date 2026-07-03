@@ -4427,6 +4427,12 @@ func TestConvertToolArguments_RepairsMalformedJSON(t *testing.T) {
 	require.NotEmpty(t, req.Message)
 }
 
+func TestConvertToolArguments_RejectsLeadingProse(t *testing.T) {
+	b := convertToolArguments("child", []byte(`Summary: {"message":"hi"}`),
+		transfer.TransferToolName)
+	require.Nil(t, b)
+}
+
 func TestProcessStreamChunk_ForwardsEvent(t *testing.T) {
 	f := NewFunctionCallResponseProcessor(false, nil)
 	ctx := context.Background()

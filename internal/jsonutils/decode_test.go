@@ -72,6 +72,13 @@ func TestDecodeFlexibleJSON(t *testing.T) {
 		require.Contains(t, err.Error(), "no JSON value found")
 	})
 
+	t.Run("preserves original error when input already starts with JSON", func(t *testing.T) {
+		var parsed map[string]any
+		err := DecodeFlexibleJSON(`{invalid json}`, &parsed)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "no JSON value found")
+	})
+
 	t.Run("repairs malformed JSON with single-quoted keys", func(t *testing.T) {
 		var parsed struct {
 			Name string `json:"name"`

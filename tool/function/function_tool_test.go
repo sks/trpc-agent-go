@@ -378,6 +378,21 @@ func TestFunctionTool_Call_UnmarshalError(t *testing.T) {
 	}
 }
 
+func TestFunctionTool_Call_RejectsLeadingProse(t *testing.T) {
+	type inputArgs struct {
+		A int `json:"a"`
+	}
+	fn := func(_ context.Context, args inputArgs) (inputArgs, error) {
+		return args, nil
+	}
+	fTool := function.NewFunctionTool(fn, function.WithName("TestTool"))
+
+	_, err := fTool.Call(context.Background(), []byte(`Summary: {"a":1}`))
+	if err == nil {
+		t.Fatal("expected error for leading prose before JSON, got nil")
+	}
+}
+
 func TestFunctionTool_Call_RepairsMalformedJSON(t *testing.T) {
 	type inputArgs struct {
 		A int `json:"a"`
