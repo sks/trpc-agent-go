@@ -564,7 +564,6 @@ func (p *FunctionCallResponseProcessor) executeToolCallsInParallel(
 		ctx, resultChan, len(toolCalls),
 	)
 
-
 	// Read the first critical sibling error from the group; prefer it over
 	// the collector's view because it carries the causal failure (the
 	// collector typically just sees ctx.Done()).
