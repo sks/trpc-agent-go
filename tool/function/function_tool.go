@@ -12,11 +12,11 @@ package function
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"reflect"
 
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
+	"trpc.group/trpc-go/trpc-agent-go/internal/jsonutils"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -351,7 +351,8 @@ func normalizeJSONArgs(jsonArgs []byte) []byte {
 	return jsonArgs
 }
 
-// Unmarshal unmarshals JSON data into the provided interface.
+// Unmarshal unmarshals JSON tool arguments with repair when the payload is malformed.
+// Valid JSON is decoded strictly without calling jsonrepair.
 func (j *jsonUnmarshaler) Unmarshal(data []byte, v any) error {
-	return json.Unmarshal(data, v)
+	return jsonutils.DecodeFlexibleJSON(string(data), v)
 }

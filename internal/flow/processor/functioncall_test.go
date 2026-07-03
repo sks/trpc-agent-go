@@ -4417,10 +4417,14 @@ func TestExecuteCallableTool_NoRetryPolicyCallsToolOnCanceledContext(t *testing.
 	require.Equal(t, "ok", result)
 }
 
-func TestConvertToolArguments_InvalidJSON(t *testing.T) {
+func TestConvertToolArguments_RepairsMalformedJSON(t *testing.T) {
 	b := convertToolArguments("child", []byte("{"),
 		transfer.TransferToolName)
-	require.Nil(t, b)
+	require.NotNil(t, b)
+	var req transfer.Request
+	require.NoError(t, json.Unmarshal(b, &req))
+	require.Equal(t, "child", req.AgentName)
+	require.NotEmpty(t, req.Message)
 }
 
 func TestProcessStreamChunk_ForwardsEvent(t *testing.T) {

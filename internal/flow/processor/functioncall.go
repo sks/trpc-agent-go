@@ -24,6 +24,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
 	"trpc.group/trpc-go/trpc-agent-go/internal/jsonrepair"
+	"trpc.group/trpc-go/trpc-agent-go/internal/jsonutils"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/appender"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
@@ -2775,7 +2776,7 @@ func convertToolArguments(originalName string, originalArgs []byte, targetName s
 
 	var input subAgentCall
 	if len(originalArgs) > 0 {
-		if err := json.Unmarshal(originalArgs, &input); err != nil {
+		if err := jsonutils.DecodeFlexibleJSON(string(originalArgs), &input); err != nil {
 			log.Warnf("Failed to unmarshal sub-agent call arguments for %s: %v", originalName, err)
 			return nil
 		}
