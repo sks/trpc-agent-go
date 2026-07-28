@@ -3382,12 +3382,16 @@ func baselineFinalResponseID(sess *session.Session, runtimeState map[string]any)
 }
 
 func collectPriorAssistantResponseIDs(sess *session.Session) map[string]struct{} {
-	if sess == nil || len(sess.Events) == 0 {
+	if sess == nil {
+		return nil
+	}
+	events := sess.GetEvents()
+	if len(events) == 0 {
 		return nil
 	}
 	var responseIDs map[string]struct{}
-	for i := range sess.Events {
-		evt := &sess.Events[i]
+	for i := range events {
+		evt := &events[i]
 		if evt.Response == nil || evt.IsPartial {
 			continue
 		}

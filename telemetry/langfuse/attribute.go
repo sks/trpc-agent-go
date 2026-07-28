@@ -62,9 +62,13 @@ const (
 
 // usageDetails collects token usage metrics for Langfuse's usage_details JSON field.
 // Fields follow Langfuse conventions and use omitempty to exclude zero-value fields.
+// CachedTokens mirrors InputCached under the common OpenAI/Guild name so exports
+// surface cache hits without requiring clients to know Langfuse's input_cached key.
 type usageDetails struct {
 	Input              int64 `json:"input,omitempty"`
 	Output             int64 `json:"output,omitempty"`
+	Total              int64 `json:"total,omitempty"`
+	CachedTokens       int64 `json:"cached_tokens,omitempty"`
 	InputCached        int64 `json:"input_cached,omitempty"`
 	InputCacheRead     int64 `json:"input_cache_read,omitempty"`
 	InputCacheCreation int64 `json:"input_cache_creation,omitempty"`
@@ -73,6 +77,19 @@ type usageDetails struct {
 // empty reports whether all fields are zero.
 func (u *usageDetails) empty() bool {
 	return *u == (usageDetails{})
+}
+
+// finalize fills Total and aliases CachedTokens from InputCached before export.
+func (u *usageDetails) finalize() {
+	if u.Input > 0 || u.Output > 0 {
+		u.Total = u.Input + u.Output
+	}
+	if u.CachedTokens == 0 && u.InputCached > 0 {
+		u.CachedTokens = u.InputCached
+	}
+	if u.InputCached == 0 && u.CachedTokens > 0 {
+		u.InputCached = u.CachedTokens
+	}
 }
 
 // observationInputPrompt is the Langfuse observation.input shape.

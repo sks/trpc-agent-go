@@ -1794,6 +1794,29 @@ func TestUpdateUserSession(t *testing.T) {
 	}
 }
 
+func TestUpdateUserSessionConcurrentWriters(t *testing.T) {
+	sess := createTestSession([]event.Event{}, nil)
+	const writers = 20
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			sess.UpdateUserSession(createTestEvent(
+				model.RoleUser,
+				fmt.Sprintf("message-%d", index),
+				time.Now(),
+				nil,
+			))
+		}(i)
+	}
+	wg.Wait()
+
+	assert.Len(t, sess.GetEvents(), writers)
+	assert.False(t, sess.UpdatedAt.IsZero())
+}
+
 func TestApplyOptions(t *testing.T) {
 	now := time.Now()
 
