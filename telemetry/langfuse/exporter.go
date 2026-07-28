@@ -206,6 +206,7 @@ func transformCallLLM(span *tracepb.Span) {
 
 	// observation.usage_details
 	if !collected.usage.empty() {
+		collected.usage.finalize()
 		if usageJSON, err := json.Marshal(collected.usage); err == nil {
 			newAttributes = append(newAttributes, stringKV(observationUsageDetails, string(usageJSON)))
 		}
@@ -246,6 +247,7 @@ func collectLLMSpanAttributes(attrs []*commonpb.KeyValue) llmSpanCollected {
 			c.usage.Output = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCached:
 			c.usage.InputCached = attr.Value.GetIntValue()
+			c.usage.CachedTokens = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCacheRead:
 			c.usage.InputCacheRead = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCacheCreation:
