@@ -10,6 +10,7 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -394,6 +395,34 @@ func TestNotesIndexTool(t *testing.T) {
 		expectedTotal := len("step 1 do thing\nstep 2 do other thing") + len("the answer is 42")
 		if out.TotalBytes != expectedTotal {
 			t.Fatalf("unexpected total bytes: %d (want %d)", out.TotalBytes, expectedTotal)
+		}
+	})
+
+	t.Run("marshals the note identifier as name with key kept as an alias", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "ni-name")
+		sess.SetState("note:findings", []byte("the answer is 42"))
+		ctx := ctxWithSession(sess)
+
+		out := mustCallNotesIndex(t, ctx)
+		if out.Notes[0].Name != "findings" {
+			t.Fatalf("expected Name to carry the note identifier, got %q", out.Notes[0].Name)
+		}
+
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Notes []map[string]any `json:"notes"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Notes[0]["name"] != "findings" {
+			t.Fatalf("expected JSON name field, got %v", decoded.Notes[0]["name"])
+		}
+		if decoded.Notes[0]["key"] != "findings" {
+			t.Fatalf("expected JSON key alias, got %v", decoded.Notes[0]["key"])
 		}
 	})
 

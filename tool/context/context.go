@@ -369,7 +369,14 @@ type NotesIndexInput struct{}
 // full body back to the model. It carries everything the LLM needs to
 // decide whether to fetch the body via read_notes.
 type NoteIndexEntry struct {
-	// Key is the note key (without the internal note: prefix).
+	// Name is the note identifier (without the internal note: prefix). It is
+	// named "name" rather than "key" because hosts commonly run redaction
+	// layers that treat any field whose name contains "key" as a secret and
+	// mask its value, which would hide the identifier the model needs to call
+	// read_notes.
+	Name string `json:"name"`
+	// Key repeats Name so consumers written against the original field keep
+	// working. Prefer Name; Key is retained only for backwards compatibility.
 	Key string `json:"key"`
 	// Bytes is the raw byte length of the stored content, useful when the
 	// model is reasoning about its remaining context budget.
@@ -448,8 +455,10 @@ func NewNotesIndexTool() tool.CallableTool {
 			total := 0
 			for _, k := range keys {
 				body := snapshot[k]
+				name := strings.TrimPrefix(k, noteKeyPrefix)
 				entries = append(entries, NoteIndexEntry{
-					Key:     strings.TrimPrefix(k, noteKeyPrefix),
+					Name:    name,
+					Key:     name,
 					Bytes:   len(body),
 					Preview: notesIndexPreview(string(body)),
 				})
@@ -464,7 +473,7 @@ func NewNotesIndexTool() tool.CallableTool {
 		},
 		function.WithName("notes_index"),
 		function.WithDescription(
-			"List the keys, byte sizes, and short previews of every persistent "+
+			"List the names, byte sizes, and short previews of every persistent "+
 				"note saved via the note tool, without returning their full "+
 				"content. Use this to discover what notes exist before deciding "+
 				"whether to fetch any of them via read_notes — much cheaper than "+
