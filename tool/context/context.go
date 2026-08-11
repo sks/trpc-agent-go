@@ -18,6 +18,7 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -255,6 +256,43 @@ const noteKeyPrefix = "note:"
 type NoteInput struct {
 	Key     string `json:"key" jsonschema:"description=Short key name for the note (e.g. 'findings' or 'plan'),required"`
 	Content string `json:"content" jsonschema:"description=The content to store. Overwrites any existing note with this key.,required"`
+}
+
+// UnmarshalJSON accepts either string or structured JSON note content. Models
+// sometimes follow the semantic request to save a ledger by passing an object
+// even though the schema asks for a string. Normalizing that object here keeps
+// the note tool usable without requiring every host to repair its arguments.
+func (n *NoteInput) UnmarshalJSON(data []byte) error {
+	var input struct {
+		Key     string          `json:"key"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &input); err != nil {
+		return fmt.Errorf("decode note input: %w", err)
+	}
+
+	n.Key = input.Key
+	if len(input.Content) == 0 {
+		n.Content = ""
+		return nil
+	}
+	if input.Content[0] == '"' {
+		if err := json.Unmarshal(input.Content, &n.Content); err != nil {
+			return fmt.Errorf("decode note content: %w", err)
+		}
+		return nil
+	}
+
+	var content any
+	if err := json.Unmarshal(input.Content, &content); err != nil {
+		return fmt.Errorf("decode structured note content: %w", err)
+	}
+	normalized, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("encode structured note content: %w", err)
+	}
+	n.Content = string(normalized)
+	return nil
 }
 
 // NoteOutput is the output for the note tool.

@@ -225,6 +225,28 @@ func TestNoteTool(t *testing.T) {
 		}
 	})
 
+	t.Run("stringifies structured content before storing it", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "s3-structured")
+		ctx := ctxWithSession(sess)
+
+		tool := NewNoteTool()
+		_, err := tool.Call(ctx, []byte(
+			`{"key":"spawn_ledger","content":{"collector":{"signals-observability":"done"}}}`,
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		val, ok := sess.GetState("note:spawn_ledger")
+		if !ok {
+			t.Fatal("expected note:spawn_ledger in state")
+		}
+		want := `{"collector":{"signals-observability":"done"}}`
+		if string(val) != want {
+			t.Fatalf("unexpected structured content: got %s, want %s", val, want)
+		}
+	})
+
 	t.Run("overwrites existing note", func(t *testing.T) {
 		sess := session.NewSession("app", "user", "s4")
 		ctx := ctxWithSession(sess)
