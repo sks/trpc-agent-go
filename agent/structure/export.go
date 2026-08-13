@@ -230,7 +230,14 @@ func cloneToolSchema(schema *tool.Schema) *tool.Schema {
 	return &tool.Schema{
 		Type:                 schema.Type,
 		Description:          schema.Description,
+		Format:               schema.Format,
 		Pattern:              schema.Pattern,
+		MinLength:            clonePointer(schema.MinLength),
+		MaxLength:            clonePointer(schema.MaxLength),
+		Minimum:              schema.Minimum,
+		Maximum:              schema.Maximum,
+		ExclusiveMinimum:     schema.ExclusiveMinimum,
+		ExclusiveMaximum:     schema.ExclusiveMaximum,
 		Required:             append([]string(nil), schema.Required...),
 		Properties:           cloneSchemaMap(schema.Properties),
 		Items:                cloneToolSchema(schema.Items),
@@ -240,6 +247,14 @@ func cloneToolSchema(schema *tool.Schema) *tool.Schema {
 		Ref:                  schema.Ref,
 		Defs:                 cloneSchemaMap(schema.Defs),
 	}
+}
+
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneSchemaMap(in map[string]*tool.Schema) map[string]*tool.Schema {

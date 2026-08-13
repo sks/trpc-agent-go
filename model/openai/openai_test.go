@@ -1369,6 +1369,53 @@ func TestModel_convertTools(t *testing.T) {
 	assert.Empty(t, props, "expected empty properties for no-arg tool")
 }
 
+func TestModel_convertTools_PreservesValidationKeywords(t *testing.T) {
+	m := New("dummy")
+	minLength := uint64(1)
+	maxLength := uint64(64)
+
+	toolsMap := map[string]tool.Tool{
+		"list_items": stubTool{decl: &tool.Declaration{
+			Name:        "list_items",
+			Description: "list items",
+			InputSchema: &tool.Schema{
+				Type: "object",
+				Properties: map[string]*tool.Schema{
+					"page_limit": {
+						Type:             "integer",
+						Minimum:          json.Number("1"),
+						Maximum:          json.Number("20"),
+						ExclusiveMinimum: json.Number("0"),
+						ExclusiveMaximum: json.Number("21"),
+					},
+					"query": {
+						Type:      "string",
+						Format:    "uuid",
+						MinLength: &minLength,
+						MaxLength: &maxLength,
+					},
+				},
+			},
+		}},
+	}
+
+	params := m.convertTools(toolsMap)
+	require.Len(t, params, 1)
+	properties, ok := params[0].Function.Parameters["properties"].(map[string]any)
+	require.True(t, ok)
+	pageLimit, ok := properties["page_limit"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, float64(1), pageLimit["minimum"])
+	assert.Equal(t, float64(20), pageLimit["maximum"])
+	assert.Equal(t, float64(0), pageLimit["exclusiveMinimum"])
+	assert.Equal(t, float64(21), pageLimit["exclusiveMaximum"])
+	query, ok := properties["query"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "uuid", query["format"])
+	assert.Equal(t, float64(1), query["minLength"])
+	assert.Equal(t, float64(64), query["maxLength"])
+}
+
 // TestModel_convertTools_StrictProxyTopLevelProperties validates the final JSON
 // payload shape expected by strict OpenAI-compatible proxies.
 func TestModel_convertTools_StrictProxyTopLevelProperties(t *testing.T) {

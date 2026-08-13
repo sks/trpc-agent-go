@@ -443,8 +443,15 @@ func TestValidateSurfaceValue_CoversAdditionalBranches(t *testing.T) {
 }
 
 func TestExport_ClonesToolSchemas(t *testing.T) {
+	minLength := uint64(1)
+	maxLength := uint64(64)
 	inputSchema := &tool.Schema{
-		Type: "object",
+		Type:      "object",
+		Format:    "custom-object",
+		MinLength: &minLength,
+		MaxLength: &maxLength,
+		Minimum:   json.Number("1"),
+		Maximum:   json.Number("20"),
 		Properties: map[string]*tool.Schema{
 			"name": {Type: "string", Pattern: "^[a-z]+$"},
 		},
@@ -491,6 +498,13 @@ func TestExport_ClonesToolSchemas(t *testing.T) {
 	require.NotSame(t, outputSchema, exported.OutputSchema)
 	require.NotNil(t, exported.InputSchema.Properties["name"])
 	assert.Equal(t, "^[a-z]+$", exported.InputSchema.Properties["name"].Pattern)
+	assert.Equal(t, "custom-object", exported.InputSchema.Format)
+	require.NotSame(t, inputSchema.MinLength, exported.InputSchema.MinLength)
+	require.NotSame(t, inputSchema.MaxLength, exported.InputSchema.MaxLength)
+	assert.Equal(t, uint64(1), *exported.InputSchema.MinLength)
+	assert.Equal(t, uint64(64), *exported.InputSchema.MaxLength)
+	assert.Equal(t, json.Number("1"), exported.InputSchema.Minimum)
+	assert.Equal(t, json.Number("20"), exported.InputSchema.Maximum)
 	require.NotNil(t, exported.OutputSchema.Items)
 	inputSchema.Properties["name"].Type = "integer"
 	assert.Equal(t, "string", exported.InputSchema.Properties["name"].Type)
@@ -506,6 +520,8 @@ func TestExport_ClonesToolSchemas(t *testing.T) {
 	assert.Equal(t, "number", inputSchema.Defs["shared"].Type)
 	outputSchema.Items.Type = "number"
 	assert.Equal(t, "string", exported.OutputSchema.Items.Type)
+	*inputSchema.MinLength = 2
+	assert.Equal(t, uint64(1), *exported.InputSchema.MinLength)
 }
 
 func TestCloneHelpers_CloneFewShotAndSchemaValues(t *testing.T) {
