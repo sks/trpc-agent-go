@@ -10,7 +10,10 @@
 // Package tool provides tool interfaces and implementations for the agent system.
 package tool
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Tool defines the interface for tools that can be used by agents.
 // It provides a common contract for all tool implementations.
@@ -63,9 +66,25 @@ type Schema struct {
 	//  Type Specifies the data type (e.g., "object", "array", "string", "number")
 	Type        string `json:"type,omitempty"`
 	Description string `json:"description,omitempty"`
+	// Format carries semantic information for values such as dates, email
+	// addresses, and UUIDs. JSON Schema 2020-12 treats it as an annotation by
+	// default.
+	Format string `json:"format,omitempty"`
 	// Pattern restricts string values to a regular expression.
-	Pattern  string   `json:"pattern,omitempty"`
-	Required []string `json:"required,omitempty"`
+	Pattern string `json:"pattern,omitempty"`
+	// MinLength and MaxLength constrain the number of Unicode code points in a
+	// string. Pointers preserve an explicitly configured zero value.
+	MinLength *uint64 `json:"minLength,omitempty"`
+	MaxLength *uint64 `json:"maxLength,omitempty"`
+	// Minimum and Maximum are inclusive numeric bounds. json.Number retains the
+	// JSON representation without forcing constraints through float64.
+	Minimum json.Number `json:"minimum,omitempty"`
+	Maximum json.Number `json:"maximum,omitempty"`
+	// ExclusiveMinimum and ExclusiveMaximum are the independent numeric bounds
+	// defined by JSON Schema draft 6 and later, including 2020-12.
+	ExclusiveMinimum json.Number `json:"exclusiveMinimum,omitempty"`
+	ExclusiveMaximum json.Number `json:"exclusiveMaximum,omitempty"`
+	Required         []string    `json:"required,omitempty"`
 	// Properties of the arguments, each with its own schema
 	Properties map[string]*Schema `json:"properties,omitempty"`
 	// For array types, defines the schema of items in the array

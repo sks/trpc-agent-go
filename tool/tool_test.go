@@ -65,3 +65,51 @@ func TestSchemaPatternJSON(t *testing.T) {
 		t.Fatalf("pattern = %q, want %q", roundTrip.Pattern, schema.Pattern)
 	}
 }
+
+func TestSchemaValidationKeywordsJSON(t *testing.T) {
+	minLength := uint64(0)
+	maxLength := uint64(100)
+	schema := &Schema{
+		Type:             "object",
+		Format:           "custom-object",
+		MinLength:        &minLength,
+		MaxLength:        &maxLength,
+		Minimum:          json.Number("0"),
+		Maximum:          json.Number("20"),
+		ExclusiveMinimum: json.Number("-1.5"),
+		ExclusiveMaximum: json.Number("20.5"),
+	}
+
+	data, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal schema: %v", err)
+	}
+
+	var encoded map[string]any
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		t.Fatalf("unmarshal encoded schema: %v", err)
+	}
+	if encoded["format"] != "custom-object" {
+		t.Fatalf("format = %v, want custom-object", encoded["format"])
+	}
+	if encoded["minLength"] != float64(0) || encoded["maxLength"] != float64(100) {
+		t.Fatalf("length bounds = (%v, %v), want (0, 100)", encoded["minLength"], encoded["maxLength"])
+	}
+	if encoded["minimum"] != float64(0) || encoded["maximum"] != float64(20) {
+		t.Fatalf("numeric bounds = (%v, %v), want (0, 20)", encoded["minimum"], encoded["maximum"])
+	}
+	if encoded["exclusiveMinimum"] != -1.5 || encoded["exclusiveMaximum"] != 20.5 {
+		t.Fatalf("exclusive bounds = (%v, %v), want (-1.5, 20.5)", encoded["exclusiveMinimum"], encoded["exclusiveMaximum"])
+	}
+
+	var roundTrip Schema
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+	if roundTrip.MinLength == nil || *roundTrip.MinLength != 0 {
+		t.Fatalf("minLength = %v, want pointer to zero", roundTrip.MinLength)
+	}
+	if roundTrip.Maximum != json.Number("20") {
+		t.Fatalf("maximum = %q, want 20", roundTrip.Maximum)
+	}
+}
