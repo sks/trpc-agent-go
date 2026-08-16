@@ -300,10 +300,6 @@ func (e *CodeExecutor) executeCommand(
 	return string(output), nil
 }
 
-func removeHelperFile(path string) {
-	_ = os.Remove(path)
-}
-
 // CodeBlockDelimiter returns the code block delimiter used by the local
 // executor.
 func (e *CodeExecutor) CodeBlockDelimiter() codeexecutor.CodeBlockDelimiter {

@@ -205,9 +205,10 @@ func transformCallLLM(span *tracepb.Span) {
 	}
 
 	// observation.usage_details
-	if !collected.usage.empty() {
-		collected.usage.finalize()
-		if usageJSON, err := json.Marshal(collected.usage); err == nil {
+	usage := collected.usage.normalized()
+	usage.finalize()
+	if !usage.empty() {
+		if usageJSON, err := json.Marshal(usage); err == nil {
 			newAttributes = append(newAttributes, stringKV(observationUsageDetails, string(usageJSON)))
 		}
 	}
@@ -342,14 +343,6 @@ func getStringPtr(v *commonpb.AnyValue) *string {
 	return &s
 }
 
-// stringValueOrNA returns the string value of v, or "N/A" if v is nil.
-func stringValueOrNA(v *commonpb.AnyValue) string {
-	if v == nil {
-		return "N/A"
-	}
-	return v.GetStringValue()
-}
-
 func stringPtrValueOrNA(v *string) string {
 	if v == nil {
 		return "N/A"
@@ -379,36 +372,6 @@ func truncateObservationInputMessages(raw string) string {
 		sanitizeTelemetryMessagesForObservation(msgs, plan)
 	}
 	if b, err := json.Marshal(msgs); err == nil {
-		return string(b)
-	}
-	return truncateObservationValue(raw)
-}
-
-func truncateObservationOutputChoices(raw string) string {
-	maxLeafBytes := getObservationMaxBytes()
-	if maxLeafBytes == 0 {
-		return ""
-	}
-	if maxLeafBytes < 0 || len([]byte(raw)) <= maxLeafBytes {
-		return raw
-	}
-	if isOTelMessagesPayload(raw) {
-		return truncateObservationJSONLeafValues(raw)
-	}
-
-	var choices []observationTelemetryChoice
-	if err := json.Unmarshal([]byte(raw), &choices); err != nil {
-		return truncateObservationValue(raw)
-	}
-
-	if maxLeafBytes > 0 {
-		plan := truncateMessagesPlan{textLimit: maxLeafBytes, binaryLimit: maxLeafBytes}
-		for i := range choices {
-			sanitizeSingleTelemetryMessageForObservation(&choices[i].Message, plan)
-			sanitizeSingleTelemetryMessageForObservation(&choices[i].Delta, plan)
-		}
-	}
-	if b, err := json.Marshal(choices); err == nil {
 		return string(b)
 	}
 	return truncateObservationValue(raw)
@@ -528,19 +491,6 @@ type observationTelemetryMessage struct {
 	Name             string              `json:"name,omitempty"`
 	ToolCalls        []model.ToolCall    `json:"tool_calls,omitempty"`
 	ReasoningContent string              `json:"reasoning_content,omitempty"`
-}
-
-type observationTelemetryChoice struct {
-	Index        int                         `json:"index"`
-	Message      observationTelemetryMessage `json:"message,omitempty"`
-	Delta        observationTelemetryMessage `json:"delta,omitempty"`
-	FinishReason *string                     `json:"finish_reason,omitempty"`
-}
-
-func sanitizeMessagesForObservation(messages []model.Message, plan truncateMessagesPlan) {
-	for i := range messages {
-		sanitizeSingleMessageForObservation(&messages[i], plan)
-	}
 }
 
 func sanitizeTelemetryMessagesForObservation(messages []observationTelemetryMessage, plan truncateMessagesPlan) {

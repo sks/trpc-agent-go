@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
+	agenttrace "trpc.group/trpc-go/trpc-agent-go/agent/trace"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
 	evalresultinmemory "trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
@@ -40,6 +42,7 @@ import (
 	criteriontext "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/criterion/text"
 	metriclocal "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/local"
 	metricregistry "trpc.group/trpc-go/trpc-agent-go/evaluation/metric/registry"
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/score"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/service"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/status"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/toolmock"
@@ -317,11 +320,52 @@ func TestInferTraceConversationClearsActualToolMockWhenConversationHasNoToolMock
 	assert.Equal(t, 0, pluginCount)
 }
 
-type fakeEvaluator struct {
-	name   string
-	result *evaluator.EvaluateResult
-	err    error
+func TestInferTraceConversationExpectedRunnerErrorPreservesExecutionTraces(t *testing.T) {
+	ctx := context.Background()
+	executionTrace := &agenttrace.Trace{RootInvocationID: "trace-root", SessionID: "session"}
+	svc := &local{}
+	evalCase := &evalset.EvalCase{
+		EvalID:                "case",
+		EvalMode:              evalset.EvalModeTrace,
+		ExpectedRunnerEnabled: true,
+		ActualConversation: []*evalset.Invocation{{
+			InvocationID:   "actual",
+			UserContent:    &model.Message{Role: model.RoleUser, Content: "question"},
+			FinalResponse:  &model.Message{Role: model.RoleAssistant, Content: "actual"},
+			ExecutionTrace: executionTrace,
+		}},
+		SessionInput: &evalset.SessionInput{UserID: "demo-user"},
+	}
 
+	inferenceResult, expectedInferences, err := svc.inferTraceConversation(ctx, evalCase, "session", &service.Options{})
+
+	require.ErrorContains(t, err, "expected runner is nil")
+	assert.Nil(t, expectedInferences)
+	require.NotNil(t, inferenceResult)
+	if assert.Len(t, inferenceResult.ExecutionTraces, 1) {
+		assert.Same(t, executionTrace, inferenceResult.ExecutionTraces[0])
+	}
+}
+
+func TestExecutionTracesFromInvocationsHandlesEmptyAndNilInvocations(t *testing.T) {
+	assert.Nil(t, executionTracesFromInvocations(nil))
+
+	executionTrace := &agenttrace.Trace{RootInvocationID: "trace-root", SessionID: "session"}
+	traces := executionTracesFromInvocations([]*evalset.Invocation{
+		nil,
+		{ExecutionTrace: executionTrace},
+	})
+
+	if assert.Len(t, traces, 2) {
+		assert.Nil(t, traces[0])
+		assert.Same(t, executionTrace, traces[1])
+	}
+}
+
+type fakeEvaluator struct {
+	name              string
+	result            *evaluator.EvaluateResult
+	err               error
 	receivedActuals   []*evalset.Invocation
 	receivedExpecteds []*evalset.Invocation
 	receivedMetric    *metric.EvalMetric
@@ -342,6 +386,36 @@ func (f *fakeEvaluator) Evaluate(ctx context.Context, actuals, expecteds []*eval
 	f.receivedActuals = actuals
 	f.receivedExpecteds = expecteds
 	f.receivedMetric = evalMetric
+	return f.result, nil
+}
+
+type failingRegistry struct {
+	err error
+}
+
+func (f failingRegistry) Register(string, evaluator.Evaluator) error {
+	return nil
+}
+
+func (f failingRegistry) Get(string) (evaluator.Evaluator, error) {
+	return nil, f.err
+}
+
+func (f failingRegistry) List() []string {
+	return nil
+}
+
+type fakeEvalCaseResultAggregator struct {
+	result *service.EvalCaseResultAggregationResult
+	err    error
+	input  *service.EvalCaseResultAggregationInput
+}
+
+func (f *fakeEvalCaseResultAggregator) Aggregate(_ context.Context, input *service.EvalCaseResultAggregationInput) (*service.EvalCaseResultAggregationResult, error) {
+	f.input = input
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.result, nil
 }
 
@@ -635,6 +709,22 @@ func TestLocalNewValidationErrors(t *testing.T) {
 				service.WithRegistry(nil),
 			},
 			wantErr: "registry is nil",
+		},
+		{
+			name: "nil_metric_registry",
+			r:    &fakeRunner{},
+			options: []service.Option{
+				service.WithMetricRegistry(nil),
+			},
+			wantErr: "metric registry is nil",
+		},
+		{
+			name: "nil_eval_case_result_aggregator",
+			r:    &fakeRunner{},
+			options: []service.Option{
+				service.WithEvalCaseResultAggregator(nil),
+			},
+			wantErr: "eval case result aggregator is nil",
 		},
 		{
 			name: "nil_session_id_supplier",
@@ -1451,6 +1541,42 @@ func TestLocalEvaluateRequestValidation(t *testing.T) {
 	assert.Nil(t, result)
 }
 
+func TestLocalResolveEvaluateOptionsUsesStoredEvalCaseResultAggregator(t *testing.T) {
+	aggregator := &fakeEvalCaseResultAggregator{}
+	svc := &local{
+		evalSetManager:           evalsetinmemory.New(),
+		registry:                 registry.New(),
+		metricRegistry:           metricregistry.New(),
+		evalCaseResultAggregator: aggregator,
+	}
+	opts, err := svc.resolveEvaluateOptions()
+	assert.NoError(t, err)
+	require.NotNil(t, opts)
+	assert.Same(t, aggregator, opts.EvalCaseResultAggregator)
+}
+
+func TestLocalResolveEvaluateOptionsRejectsNilEvalCaseResultAggregator(t *testing.T) {
+	svc := &local{
+		evalSetManager: evalsetinmemory.New(),
+		registry:       registry.New(),
+		metricRegistry: metricregistry.New(),
+	}
+	opts, err := svc.resolveEvaluateOptions()
+	assert.ErrorContains(t, err, "eval case result aggregator is nil")
+	assert.Nil(t, opts)
+}
+
+func TestLocalResolveEvaluateOptionsRejectsNilMetricRegistry(t *testing.T) {
+	svc := &local{
+		evalSetManager:           evalsetinmemory.New(),
+		registry:                 registry.New(),
+		evalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
+	}
+	opts, err := svc.resolveEvaluateOptions()
+	assert.ErrorContains(t, err, "metric registry is nil")
+	assert.Nil(t, opts)
+}
+
 func TestLocalEvaluateParallelInvokeFailureAddsContext(t *testing.T) {
 	ctx := context.Background()
 	appName := "app"
@@ -1506,6 +1632,35 @@ func TestLocalEvaluateParallelInvokeFailureAddsContext(t *testing.T) {
 	}
 }
 
+func TestLocalEvaluateWrapsMetricExtensionResolveError(t *testing.T) {
+	ctx := context.Background()
+	svc := &local{
+		evalSetManager:           evalsetinmemory.New(),
+		registry:                 registry.New(),
+		metricRegistry:           metricregistry.New(),
+		evalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
+	}
+	result, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:          "app",
+		EvalSetID:        "set",
+		InferenceResults: []*service.InferenceResult{},
+		EvaluateConfig: &service.EvaluateConfig{
+			EvalMetrics: []*metric.EvalMetric{
+				{
+					Criterion: &criterion.Criterion{
+						FinalResponse: &finalresponse.FinalResponseCriterion{
+							Text: &criteriontext.TextCriterion{CompareName: "missing"},
+						},
+					},
+				},
+			},
+		},
+	})
+	assert.ErrorContains(t, err, "resolve metric extensions")
+	assert.ErrorContains(t, err, "resolve metric at index 0")
+	assert.Nil(t, result)
+}
+
 func TestLocalEvaluateSuccess(t *testing.T) {
 	ctx := context.Background()
 	appName := "app"
@@ -1524,7 +1679,18 @@ func TestLocalEvaluateSuccess(t *testing.T) {
 			OverallScore:  0.8,
 			OverallStatus: status.EvalStatusPassed,
 			PerInvocationResults: []*evaluator.PerInvocationResult{
-				{Score: 0.8, Status: status.EvalStatusPassed},
+				{
+					Score:  0.8,
+					Status: status.EvalStatusPassed,
+					Details: &evaluator.PerInvocationDetails{
+						Reason: "category matched",
+						Score:  0.8,
+						Value: &score.Value{
+							Kind:        score.KindCategorical,
+							Categorical: "correct",
+						},
+					},
+				},
 			},
 		},
 	}
@@ -1555,8 +1721,14 @@ func TestLocalEvaluateSuccess(t *testing.T) {
 	assert.Len(t, caseResult.OverallEvalMetricResults, 1)
 	assert.Equal(t, metricName, caseResult.OverallEvalMetricResults[0].MetricName)
 	assert.Equal(t, 0.8, caseResult.OverallEvalMetricResults[0].Score)
+	assert.Nil(t, caseResult.OverallEvalMetricResults[0].Details.Value)
 	assert.Len(t, caseResult.EvalMetricResultPerInvocation, 1)
 	assert.Len(t, caseResult.EvalMetricResultPerInvocation[0].EvalMetricResults, 1)
+	perMetric := caseResult.EvalMetricResultPerInvocation[0].EvalMetricResults[0]
+	require.NotNil(t, perMetric.Details)
+	require.NotNil(t, perMetric.Details.Value)
+	assert.Equal(t, score.KindCategorical, perMetric.Details.Value.Kind)
+	assert.Equal(t, "correct", perMetric.Details.Value.Categorical)
 	assert.Equal(t, "demo-user", caseResult.UserID)
 }
 
@@ -2105,7 +2277,7 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, mgr, reg, inference, config := tc.setup(t)
-			opts := &service.Options{EvalSetManager: mgr, Registry: reg}
+			opts := service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg))
 			_, err := svc.evaluatePerCase(ctx, inference, config, opts)
 			if tc.expectErr {
 				assert.Error(t, err)
@@ -2124,8 +2296,9 @@ func TestLocalEvaluatePerCaseRejectsNilManagers(t *testing.T) {
 	config := &service.EvaluateConfig{EvalMetrics: []*metric.EvalMetric{}}
 
 	_, err := svc.evaluatePerCase(ctx, inference, config, &service.Options{
-		EvalSetManager: nil,
-		Registry:       registry.New(),
+		EvalSetManager:           nil,
+		Registry:                 registry.New(),
+		EvalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
 	})
 	assert.Error(t, err)
 	if err != nil {
@@ -2133,13 +2306,69 @@ func TestLocalEvaluatePerCaseRejectsNilManagers(t *testing.T) {
 	}
 
 	_, err = svc.evaluatePerCase(ctx, inference, config, &service.Options{
-		EvalSetManager: evalsetinmemory.New(),
-		Registry:       nil,
+		EvalSetManager:           evalsetinmemory.New(),
+		Registry:                 nil,
+		EvalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
 	})
 	assert.Error(t, err)
 	if err != nil {
 		assert.Contains(t, err.Error(), "registry is nil")
 	}
+}
+
+func TestLocalEvaluatePerCaseReturnsRegistryLookupError(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-registry-error"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	require.NoError(t, err)
+	require.NoError(t, mgr.AddCase(ctx, appName, evalSetID, makeEvalCase(appName, caseID, "prompt")))
+	svc := &local{}
+	inference := makeInferenceResult(appName, evalSetID, caseID, "session", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	result, err := svc.evaluatePerCase(ctx, inference, &service.EvaluateConfig{
+		EvalMetrics: []*metric.EvalMetric{{MetricName: "metric-registry-error"}},
+	}, &service.Options{
+		EvalSetManager:           mgr,
+		Registry:                 failingRegistry{err: errors.New("registry failed")},
+		EvalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
+	})
+	assert.ErrorContains(t, err, "registry failed")
+	assert.Nil(t, result)
+}
+
+func TestLocalEvaluatePerCaseReturnsEffectiveMetricError(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-effective-metric-error"
+	metricName := "metric-case-rubric"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	require.NoError(t, err)
+	evalCase := makeEvalCase(appName, caseID, "prompt")
+	evalCase.Rubrics = []*evalset.EvalCaseRubric{
+		{MetricName: metricName, ID: "case-rubric", Content: &evalset.EvalCaseRubricContent{Text: "Case-specific rule."}},
+	}
+	require.NoError(t, mgr.AddCase(ctx, appName, evalSetID, evalCase))
+	reg := registry.New()
+	require.NoError(t, reg.Register(metricName, &fakeEvaluator{name: metricName}))
+	svc := &local{}
+	inference := makeInferenceResult(appName, evalSetID, caseID, "session", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	result, err := svc.evaluatePerCase(ctx, inference, &service.EvaluateConfig{
+		EvalMetrics: []*metric.EvalMetric{{MetricName: metricName}},
+	}, &service.Options{
+		EvalSetManager:           mgr,
+		Registry:                 reg,
+		EvalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
+	})
+	assert.ErrorContains(t, err, "llmJudge criterion is required")
+	assert.Nil(t, result)
 }
 
 func TestLocalInferenceTraceModeSkipsRunner(t *testing.T) {
@@ -2235,6 +2464,9 @@ func TestLocalInferenceTraceModeUsesConfiguredActualConversation(t *testing.T) {
 	_, err := mgr.Create(ctx, appName, evalSetID)
 	assert.NoError(t, err)
 
+	executionTrace := &agenttrace.Trace{RootInvocationID: "trace-root-1", SessionID: "trace-session-1"}
+	actualInvocation := makeActualInvocation("trace-inv-1", "prompt", "answer")
+	actualInvocation.ExecutionTrace = executionTrace
 	traceCase := &evalset.EvalCase{
 		EvalID:   caseID,
 		EvalMode: evalset.EvalModeTrace,
@@ -2242,7 +2474,7 @@ func TestLocalInferenceTraceModeUsesConfiguredActualConversation(t *testing.T) {
 			makeInvocation("trace-inv-1", "prompt"),
 		},
 		ActualConversation: []*evalset.Invocation{
-			makeActualInvocation("trace-inv-1", "prompt", "answer"),
+			actualInvocation,
 		},
 		SessionInput: &evalset.SessionInput{AppName: appName, UserID: "demo-user", State: map[string]any{}},
 	}
@@ -2262,6 +2494,10 @@ func TestLocalInferenceTraceModeUsesConfiguredActualConversation(t *testing.T) {
 	assert.Equal(t, "trace-inv-1", results[0].Inferences[0].InvocationID)
 	assert.NotNil(t, results[0].Inferences[0].FinalResponse)
 	assert.Equal(t, "answer", results[0].Inferences[0].FinalResponse.Content)
+	if assert.Len(t, results[0].ExecutionTraces, 1) {
+		assert.Equal(t, executionTrace.RootInvocationID, results[0].ExecutionTraces[0].RootInvocationID)
+		assert.Equal(t, executionTrace.SessionID, results[0].ExecutionTraces[0].SessionID)
+	}
 
 	runnerStub.mu.Lock()
 	callCount := len(runnerStub.calls)
@@ -3696,10 +3932,11 @@ func TestLocalEvaluateAfterEvaluateSetReceivesNilResultWhenEvaluateFails(t *test
 	})
 
 	svc := &local{
-		callbacks:      callbacks,
-		evalSetManager: evalsetinmemory.New(),
-		registry:       registry.New(),
-		metricRegistry: metricregistry.New(),
+		callbacks:                callbacks,
+		evalSetManager:           evalsetinmemory.New(),
+		registry:                 registry.New(),
+		metricRegistry:           metricregistry.New(),
+		evalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
 	}
 	_, err := svc.Evaluate(ctx, req)
 	assert.Error(t, err)
@@ -3739,10 +3976,11 @@ func TestLocalEvaluateAfterEvaluateSetReceivesRunResultOnSuccess(t *testing.T) {
 	})
 
 	svc := &local{
-		callbacks:      callbacks,
-		evalSetManager: evalsetinmemory.New(),
-		registry:       registry.New(),
-		metricRegistry: metricregistry.New(),
+		callbacks:                callbacks,
+		evalSetManager:           evalsetinmemory.New(),
+		registry:                 registry.New(),
+		metricRegistry:           metricregistry.New(),
+		evalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
 	}
 	res, err := svc.Evaluate(ctx, req)
 	assert.NoError(t, err)
@@ -3893,6 +4131,43 @@ func TestPrepareCaseEvaluationInputsScenarioBuildsPlaceholderExpecteds(t *testin
 	}
 }
 
+func TestPrepareCaseEvaluationInputsAttachesExecutionTraces(t *testing.T) {
+	evalCase := makeEvalCase("app", "case-1", "prompt")
+	evalCase.Conversation[0].FinalResponse = &model.Message{Role: model.RoleAssistant, Content: "expected"}
+	traceOne := &agenttrace.Trace{RootInvocationID: "root-1"}
+	traceTwo := &agenttrace.Trace{RootInvocationID: "root-2"}
+	inferenceResult := makeInferenceResult("app", "set", "case-1", "session-1", []*evalset.Invocation{
+		makeActualInvocation("inv-1", "prompt", "answer"),
+		makeActualInvocation("inv-2", "prompt two", "answer two"),
+	})
+	inferenceResult.Inferences[1].UserContent = &model.Message{Role: model.RoleUser, Content: "prompt two"}
+	evalCase.Conversation = []*evalset.Invocation{
+		{UserContent: &model.Message{Role: model.RoleUser, Content: "prompt"}, FinalResponse: &model.Message{Role: model.RoleAssistant, Content: "expected"}},
+		{UserContent: &model.Message{Role: model.RoleUser, Content: "prompt two"}, FinalResponse: &model.Message{Role: model.RoleAssistant, Content: "expected two"}},
+	}
+	inferenceResult.ExecutionTraces = []*agenttrace.Trace{traceOne, traceTwo}
+	svc := &local{}
+	inputs, err := svc.prepareCaseEvaluationInputs(context.Background(), inferenceResult, evalCase, &service.Options{})
+	assert.NoError(t, err)
+	if assert.Len(t, inputs.actuals, 2) {
+		assert.Same(t, traceOne, inputs.actuals[0].ExecutionTrace)
+		assert.Same(t, traceTwo, inputs.actuals[1].ExecutionTrace)
+	}
+}
+
+func TestPrepareCaseEvaluationInputsRejectsMisalignedExecutionTraces(t *testing.T) {
+	evalCase := makeEvalCase("app", "case-1", "prompt")
+	evalCase.Conversation[0].FinalResponse = &model.Message{Role: model.RoleAssistant, Content: "expected"}
+	inferenceResult := makeInferenceResult("app", "set", "case-1", "session-1", []*evalset.Invocation{
+		makeActualInvocation("inv-1", "prompt", "answer"),
+	})
+	inferenceResult.ExecutionTraces = []*agenttrace.Trace{{RootInvocationID: "root-1"}, {RootInvocationID: "root-2"}}
+	svc := &local{}
+	inputs, err := svc.prepareCaseEvaluationInputs(context.Background(), inferenceResult, evalCase, &service.Options{})
+	assert.ErrorContains(t, err, "execution trace count 2 does not match inference count 1")
+	assert.Nil(t, inputs)
+}
+
 func TestEvaluatePerCaseScenarioRunsConfiguredMetric(t *testing.T) {
 	ctx := context.Background()
 	appName := "app"
@@ -3923,10 +4198,12 @@ func TestEvaluatePerCaseScenarioRunsConfiguredMetric(t *testing.T) {
 			{MetricName: "llm_rubric_response"},
 		},
 	}, &service.Options{
-		EvalSetManager: mgr,
-		Registry:       reg,
+		EvalSetManager:           mgr,
+		Registry:                 reg,
+		EvalCaseResultAggregator: service.NewOptions().EvalCaseResultAggregator,
 	})
 	assert.NoError(t, err)
+	assert.Equal(t, 1.0, result.Score)
 	assert.Equal(t, status.EvalStatusPassed, result.FinalEvalStatus)
 	assert.Len(t, result.OverallEvalMetricResults, 1)
 	if assert.Len(t, result.EvalMetricResultPerInvocation, 1) {
@@ -3936,6 +4213,185 @@ func TestEvaluatePerCaseScenarioRunsConfiguredMetric(t *testing.T) {
 	assert.Equal(t, status.EvalStatusPassed, result.OverallEvalMetricResults[0].EvalStatus)
 	assert.Equal(t, inferenceResult.Inferences, fakeEval.receivedActuals)
 	assert.Len(t, fakeEval.receivedExpecteds, 1)
+}
+
+func TestLocalEvaluateUsesEvalCaseResultAggregator(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-aggregate"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, makeEvalCase(appName, caseID, "prompt")))
+	reg := registry.New()
+	fakeEval := &fakeEvaluator{
+		name: "metric-aggregate",
+		result: &evaluator.EvaluateResult{
+			OverallScore:         0.2,
+			OverallStatus:        status.EvalStatusFailed,
+			PerInvocationResults: []*evaluator.PerInvocationResult{{Score: 0.2, Status: status.EvalStatusFailed}},
+		},
+	}
+	assert.NoError(t, reg.Register(fakeEval.name, fakeEval))
+	aggregator := &fakeEvalCaseResultAggregator{
+		result: &service.EvalCaseResultAggregationResult{Score: 0.75, Status: status.EvalStatusPassed},
+	}
+	svc, err := New(
+		&fakeRunner{},
+		service.WithEvalSetManager(mgr),
+		service.WithRegistry(reg),
+		service.WithEvalCaseResultAggregator(aggregator),
+	)
+	require.NoError(t, err)
+	inferenceResult := makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	runResult, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:          appName,
+		EvalSetID:        evalSetID,
+		InferenceResults: []*service.InferenceResult{inferenceResult},
+		EvaluateConfig: &service.EvaluateConfig{
+			EvalMetrics: []*metric.EvalMetric{{
+				MetricName: fakeEval.name,
+				Threshold:  0.8,
+				Extension:  map[string]any{"weight": 0.7},
+			}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, runResult.EvalCaseResults, 1)
+	caseResult := runResult.EvalCaseResults[0]
+	assert.Equal(t, 0.75, caseResult.Score)
+	assert.Equal(t, status.EvalStatusPassed, caseResult.FinalEvalStatus)
+	require.NotNil(t, aggregator.input)
+	assert.Equal(t, appName, aggregator.input.AppName)
+	assert.Equal(t, evalSetID, aggregator.input.EvalSetID)
+	assert.Equal(t, caseID, aggregator.input.EvalCase.EvalID)
+	assert.Same(t, inferenceResult, aggregator.input.InferenceResult)
+	require.Len(t, aggregator.input.EvalMetrics, 1)
+	assert.Equal(t, fakeEval.name, aggregator.input.EvalMetrics[0].MetricName)
+	assert.Equal(t, 0.8, aggregator.input.EvalMetrics[0].Threshold)
+	assert.Equal(t, map[string]any{"weight": 0.7}, aggregator.input.EvalMetrics[0].Extension)
+	require.Len(t, aggregator.input.MetricResults, 1)
+	assert.Equal(t, status.EvalStatusFailed, aggregator.input.MetricResults[0].EvalStatus)
+}
+
+func TestLocalEvaluateMarksCaseFailedWhenEvalCaseResultAggregatorFails(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-aggregate-error"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, makeEvalCase(appName, caseID, "prompt")))
+	aggregator := &fakeEvalCaseResultAggregator{err: errors.New("aggregate failed")}
+	svc, err := New(
+		&fakeRunner{},
+		service.WithEvalSetManager(mgr),
+		service.WithEvalCaseResultAggregator(aggregator),
+	)
+	require.NoError(t, err)
+	runResult, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:   appName,
+		EvalSetID: evalSetID,
+		InferenceResults: []*service.InferenceResult{
+			makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+				makeActualInvocation("actual-1", "prompt", "answer"),
+			}),
+		},
+		EvaluateConfig: &service.EvaluateConfig{EvalMetrics: []*metric.EvalMetric{}},
+	})
+	require.NoError(t, err)
+	require.Len(t, runResult.EvalCaseResults, 1)
+	assert.Equal(t, status.EvalStatusFailed, runResult.EvalCaseResults[0].FinalEvalStatus)
+	assert.Contains(t, runResult.EvalCaseResults[0].ErrorMessage, "aggregate eval case result")
+	assert.Contains(t, runResult.EvalCaseResults[0].ErrorMessage, "aggregate failed")
+}
+
+func TestLocalEvaluateMarksCaseFailedWhenEvalCaseResultAggregatorReturnsNonFiniteScore(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-aggregate-nan"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, makeEvalCase(appName, caseID, "prompt")))
+	aggregator := &fakeEvalCaseResultAggregator{
+		result: &service.EvalCaseResultAggregationResult{Score: math.NaN(), Status: status.EvalStatusPassed},
+	}
+	svc, err := New(
+		&fakeRunner{},
+		service.WithEvalSetManager(mgr),
+		service.WithEvalCaseResultAggregator(aggregator),
+	)
+	require.NoError(t, err)
+	runResult, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:   appName,
+		EvalSetID: evalSetID,
+		InferenceResults: []*service.InferenceResult{
+			makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+				makeActualInvocation("actual-1", "prompt", "answer"),
+			}),
+		},
+		EvaluateConfig: &service.EvaluateConfig{},
+	})
+	require.NoError(t, err)
+	require.Len(t, runResult.EvalCaseResults, 1)
+	assert.Equal(t, status.EvalStatusFailed, runResult.EvalCaseResults[0].FinalEvalStatus)
+	assert.Contains(t, runResult.EvalCaseResults[0].ErrorMessage, "eval case result aggregation score must be finite")
+}
+
+func TestLocalEvaluatePerCaseRejectsInvalidEvalCaseResultAggregation(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-invalid-aggregation"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	require.NoError(t, err)
+	require.NoError(t, mgr.AddCase(ctx, appName, evalSetID, makeEvalCase(appName, caseID, "prompt")))
+	reg := registry.New()
+	svc := newLocalService(t, &fakeRunner{}, mgr, reg, "session-1")
+	inferenceResult := makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	tests := []struct {
+		name       string
+		aggregator service.EvalCaseResultAggregator
+		wantErr    string
+	}{
+		{
+			name:       "nil aggregator",
+			aggregator: nil,
+			wantErr:    "eval case result aggregator is nil",
+		},
+		{
+			name:       "nil aggregation result",
+			aggregator: &fakeEvalCaseResultAggregator{},
+			wantErr:    "eval case result aggregation result is nil",
+		},
+		{
+			name: "unknown aggregation status",
+			aggregator: &fakeEvalCaseResultAggregator{
+				result: &service.EvalCaseResultAggregationResult{Status: status.EvalStatusUnknown},
+			},
+			wantErr: "unexpected eval case result aggregation status",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := svc.evaluatePerCase(ctx, inferenceResult, &service.EvaluateConfig{}, &service.Options{
+				EvalSetManager:           mgr,
+				Registry:                 reg,
+				EvalCaseResultAggregator: tc.aggregator,
+			})
+			assert.ErrorContains(t, err, tc.wantErr)
+			assert.Nil(t, result)
+		})
+	}
 }
 
 func TestBuildCaseEffectiveMetricAppendsCaseRubrics(t *testing.T) {
@@ -4026,10 +4482,7 @@ func TestEvaluatePerCaseUsesCaseEffectiveMetric(t *testing.T) {
 	})
 	result, err := svc.evaluatePerCase(ctx, inferenceResult, &service.EvaluateConfig{
 		EvalMetrics: []*metric.EvalMetric{configuredMetric},
-	}, &service.Options{
-		EvalSetManager: mgr,
-		Registry:       reg,
-	})
+	}, service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg)))
 	assert.NoError(t, err)
 	assert.Equal(t, status.EvalStatusPassed, result.FinalEvalStatus)
 	assert.Len(t, configuredMetric.Criterion.LLMJudge.Rubrics, 1)
@@ -4086,7 +4539,7 @@ func TestEvaluatePerCaseBindsCaseRubricByMetricNameWhenEvaluatorNameDiffers(t *t
 				Criterion:     &criterion.Criterion{LLMJudge: &criterionllm.LLMCriterion{}},
 			},
 		},
-	}, &service.Options{EvalSetManager: mgr, Registry: reg})
+	}, service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg)))
 	assert.NoError(t, err)
 	assert.Equal(t, status.EvalStatusPassed, result.FinalEvalStatus)
 	require.NotNil(t, fakeEval.receivedMetric)
@@ -4130,7 +4583,7 @@ func TestEvaluatePerCaseTemplateEvaluatorKeepsCaseRubricInEffectiveCriterion(t *
 				Criterion:     &criterion.Criterion{LLMJudge: &criterionllm.LLMCriterion{}},
 			},
 		},
-	}, &service.Options{EvalSetManager: mgr, Registry: reg})
+	}, service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg)))
 	assert.NoError(t, err)
 	assert.Equal(t, status.EvalStatusPassed, result.FinalEvalStatus)
 	if assert.Len(t, result.OverallEvalMetricResults, 1) {
@@ -4139,6 +4592,211 @@ func TestEvaluatePerCaseTemplateEvaluatorKeepsCaseRubricInEffectiveCriterion(t *
 		if assert.Len(t, result.OverallEvalMetricResults[0].Criterion.LLMJudge.Rubrics, 1) {
 			assert.Equal(t, "case:template", result.OverallEvalMetricResults[0].Criterion.LLMJudge.Rubrics[0].ID)
 		}
+	}
+}
+
+func TestEvaluatePerCaseTemplateTraceBindingMaterializesPromptAndPersistsActualTrace(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-template-trace"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	evalCase := makeEvalCase(appName, caseID, "prompt")
+	evalCase.Conversation[0].FinalResponse = &model.Message{Role: model.RoleAssistant, Content: "expected"}
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, evalCase))
+	reg := registry.New()
+	fakeEval := &fakeEvaluator{
+		name: llmtemplateevaluator.EvaluatorName,
+		result: &evaluator.EvaluateResult{
+			OverallScore:         1,
+			OverallStatus:        status.EvalStatusPassed,
+			PerInvocationResults: []*evaluator.PerInvocationResult{{Score: 1, Status: status.EvalStatusPassed}},
+		},
+	}
+	assert.NoError(t, reg.Register(fakeEval.name, fakeEval))
+	executionTrace := &agenttrace.Trace{
+		RootInvocationID: "root-1",
+		Steps: []agenttrace.Step{
+			{NodeID: "fetch_match", Output: &agenttrace.Snapshot{Text: "stale data"}},
+			{NodeID: "fetch_match", Output: &agenttrace.Snapshot{Text: "fresh match data"}},
+		},
+	}
+	inferenceResult := makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	inferenceResult.ExecutionTraces = []*agenttrace.Trace{executionTrace}
+	svc := newLocalService(t, &fakeRunner{}, mgr, reg, "session-1")
+	result, err := svc.evaluatePerCase(ctx, inferenceResult, &service.EvaluateConfig{
+		EvalMetrics: []*metric.EvalMetric{
+			{
+				MetricName:    "trace_template",
+				EvaluatorName: llmtemplateevaluator.EvaluatorName,
+				Threshold:     0.5,
+				Criterion: &criterion.Criterion{
+					LLMJudge: &criterionllm.LLMCriterion{
+						Template: &criterionllm.JudgeTemplateOptions{
+							Prompt:             "Trace output: {{trace_output}}",
+							ResponseScorerName: "single_score",
+							VariableBindings: []*criterionllm.TemplateVariableBinding{
+								{
+									TemplateVariable: "trace_output",
+									Source: &criterionllm.TemplateVariableSource{
+										Scope: criterionllm.TemplateVariableScopeActual,
+										Field: criterionllm.TemplateVariableFieldTraceStepOutput,
+										Selector: &criterionllm.TemplateVariableSelector{
+											NodeID: "fetch_match",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg)))
+	assert.NoError(t, err)
+	assert.Equal(t, status.EvalStatusPassed, result.FinalEvalStatus)
+	require.NotNil(t, fakeEval.receivedActuals[0].ExecutionTrace)
+	assert.Same(t, executionTrace, fakeEval.receivedActuals[0].ExecutionTrace)
+	if assert.Len(t, result.EvalMetricResultPerInvocation, 1) {
+		perInvocation := result.EvalMetricResultPerInvocation[0]
+		require.NotNil(t, perInvocation.ActualInvocation)
+		assert.Same(t, executionTrace, perInvocation.ActualInvocation.ExecutionTrace)
+		if assert.Len(t, perInvocation.EvalMetricResults, 1) {
+			gotCriterion := perInvocation.EvalMetricResults[0].Criterion
+			require.NotNil(t, gotCriterion)
+			require.NotNil(t, gotCriterion.LLMJudge)
+			require.NotNil(t, gotCriterion.LLMJudge.Template)
+			assert.Contains(t, gotCriterion.LLMJudge.Template.Prompt, "fresh match data")
+			assert.NotContains(t, gotCriterion.LLMJudge.Template.Prompt, "stale data")
+		}
+	}
+}
+
+func TestEvaluateTemplateMetricWithoutTraceBindingAllowsEmptyExecutionTraces(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-template-no-trace"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	evalCase := makeEvalCase(appName, caseID, "prompt")
+	evalCase.Conversation[0].FinalResponse = &model.Message{Role: model.RoleAssistant, Content: "expected"}
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, evalCase))
+	reg := registry.New()
+	fakeEval := &fakeEvaluator{
+		name: llmtemplateevaluator.EvaluatorName,
+		result: &evaluator.EvaluateResult{
+			OverallScore:         1,
+			OverallStatus:        status.EvalStatusPassed,
+			PerInvocationResults: []*evaluator.PerInvocationResult{{Score: 1, Status: status.EvalStatusPassed}},
+		},
+	}
+	assert.NoError(t, reg.Register(fakeEval.name, fakeEval))
+	inferenceResult := makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	svc := newLocalService(t, &fakeRunner{}, mgr, reg, "session-1")
+	result, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:          appName,
+		EvalSetID:        evalSetID,
+		InferenceResults: []*service.InferenceResult{inferenceResult},
+		EvaluateConfig: &service.EvaluateConfig{EvalMetrics: []*metric.EvalMetric{
+			{
+				MetricName:    "final_template",
+				EvaluatorName: llmtemplateevaluator.EvaluatorName,
+				Threshold:     0.5,
+				Criterion: &criterion.Criterion{
+					LLMJudge: &criterionllm.LLMCriterion{
+						Template: &criterionllm.JudgeTemplateOptions{
+							Prompt:             "Answer: {{answer}}",
+							ResponseScorerName: "single_score",
+							VariableBindings: []*criterionllm.TemplateVariableBinding{
+								{
+									TemplateVariable: "answer",
+									Source: &criterionllm.TemplateVariableSource{
+										Scope: criterionllm.TemplateVariableScopeActual,
+										Field: criterionllm.TemplateVariableFieldFinalResponse,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}},
+	})
+	assert.NoError(t, err)
+	if assert.Len(t, result.EvalCaseResults, 1) {
+		assert.Equal(t, status.EvalStatusPassed, result.EvalCaseResults[0].FinalEvalStatus)
+	}
+}
+
+func TestEvaluateTemplateTraceBindingMissingTraceReturnsFailedCaseResult(t *testing.T) {
+	ctx := context.Background()
+	appName := "app"
+	evalSetID := "set"
+	caseID := "case-template-missing-trace"
+	mgr := evalsetinmemory.New()
+	_, err := mgr.Create(ctx, appName, evalSetID)
+	assert.NoError(t, err)
+	evalCase := makeEvalCase(appName, caseID, "prompt")
+	evalCase.Conversation[0].FinalResponse = &model.Message{Role: model.RoleAssistant, Content: "expected"}
+	assert.NoError(t, mgr.AddCase(ctx, appName, evalSetID, evalCase))
+	reg := registry.New()
+	fakeEval := &fakeEvaluator{
+		name: llmtemplateevaluator.EvaluatorName,
+		result: &evaluator.EvaluateResult{
+			OverallScore:         1,
+			OverallStatus:        status.EvalStatusPassed,
+			PerInvocationResults: []*evaluator.PerInvocationResult{{Score: 1, Status: status.EvalStatusPassed}},
+		},
+	}
+	assert.NoError(t, reg.Register(fakeEval.name, fakeEval))
+	inferenceResult := makeInferenceResult(appName, evalSetID, caseID, "session-1", []*evalset.Invocation{
+		makeActualInvocation("actual-1", "prompt", "answer"),
+	})
+	svc := newLocalService(t, &fakeRunner{}, mgr, reg, "session-1")
+	result, err := svc.Evaluate(ctx, &service.EvaluateRequest{
+		AppName:          appName,
+		EvalSetID:        evalSetID,
+		InferenceResults: []*service.InferenceResult{inferenceResult},
+		EvaluateConfig: &service.EvaluateConfig{EvalMetrics: []*metric.EvalMetric{
+			{
+				MetricName:    "trace_template",
+				EvaluatorName: llmtemplateevaluator.EvaluatorName,
+				Threshold:     0.5,
+				Criterion: &criterion.Criterion{
+					LLMJudge: &criterionllm.LLMCriterion{
+						Template: &criterionllm.JudgeTemplateOptions{
+							Prompt:             "Trace output: {{trace_output}}",
+							ResponseScorerName: "single_score",
+							VariableBindings: []*criterionllm.TemplateVariableBinding{
+								{
+									TemplateVariable: "trace_output",
+									Source: &criterionllm.TemplateVariableSource{
+										Scope: criterionllm.TemplateVariableScopeActual,
+										Field: criterionllm.TemplateVariableFieldTraceStepOutput,
+										Selector: &criterionllm.TemplateVariableSelector{
+											NodeID: "fetch_match",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}},
+	})
+	assert.NoError(t, err)
+	if assert.Len(t, result.EvalCaseResults, 1) {
+		assert.Equal(t, status.EvalStatusFailed, result.EvalCaseResults[0].FinalEvalStatus)
+		assert.Contains(t, result.EvalCaseResults[0].ErrorMessage, "executionTrace is empty")
 	}
 }
 
@@ -4281,10 +4939,7 @@ func TestEvaluatePerCaseSkipsMissingEvaluatorWithCaseRubric(t *testing.T) {
 		EvalMetrics: []*metric.EvalMetric{
 			{MetricName: "missing_metric"},
 		},
-	}, &service.Options{
-		EvalSetManager: mgr,
-		Registry:       reg,
-	})
+	}, service.NewOptions(service.WithEvalSetManager(mgr), service.WithRegistry(reg)))
 	assert.NoError(t, err)
 	assert.Equal(t, status.EvalStatusNotEvaluated, result.FinalEvalStatus)
 	assert.Empty(t, result.OverallEvalMetricResults)

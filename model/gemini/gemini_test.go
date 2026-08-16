@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"net/http"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -162,6 +164,9 @@ func TestModel_convertMessages(t *testing.T) {
 		imageURL  = "imageURL"
 		imageData = "imageData"
 		audioURL  = "audioURL"
+		audioData = "audioData"
+		videoURL  = "videoURL"
+		videoData = "videoData"
 		fileURL   = "fileURL"
 	)
 	type fields struct {
@@ -248,8 +253,20 @@ func TestModel_convertMessages(t *testing.T) {
 							{
 								Type: model.ContentTypeAudio,
 								Audio: &model.Audio{
-									Data: []byte(audioURL),
+									URL:    audioURL,
+									Format: "mpeg",
 								},
+							},
+							{
+								Type: model.ContentTypeAudio,
+								Audio: &model.Audio{
+									Data:   []byte(audioData),
+									Format: "audio/wav",
+								},
+							},
+							{
+								Type:  model.ContentTypeAudio,
+								Audio: &model.Audio{Format: " "},
 							},
 						},
 					},
@@ -257,7 +274,51 @@ func TestModel_convertMessages(t *testing.T) {
 			},
 			want: []*genai.Content{
 				genai.NewContentFromParts([]*genai.Part{
-					genai.NewPartFromBytes([]byte(audioURL), ""),
+					genai.NewPartFromURI(audioURL, "audio/mpeg"),
+				}, genai.RoleUser),
+				genai.NewContentFromParts([]*genai.Part{
+					genai.NewPartFromBytes([]byte(audioData), "audio/wav"),
+				}, genai.RoleUser),
+			},
+		},
+		{
+			name: "video",
+			fields: fields{
+				m: &Model{},
+			},
+			args: args{
+				messages: []model.Message{
+					{
+						Role: model.RoleUser,
+						ContentParts: []model.ContentPart{
+							{
+								Type: model.ContentTypeVideo,
+								Video: &model.Video{
+									URL:    videoURL,
+									Format: "mp4",
+								},
+							},
+							{
+								Type: model.ContentTypeVideo,
+								Video: &model.Video{
+									Data:   []byte(videoData),
+									Format: "video/mp4",
+								},
+							},
+							{
+								Type:  model.ContentTypeVideo,
+								Video: &model.Video{Format: " "},
+							},
+						},
+					},
+				},
+			},
+			want: []*genai.Content{
+				genai.NewContentFromParts([]*genai.Part{
+					genai.NewPartFromURI(videoURL, "video/mp4"),
+				}, genai.RoleUser),
+				genai.NewContentFromParts([]*genai.Part{
+					genai.NewPartFromBytes([]byte(videoData), "video/mp4"),
 				}, genai.RoleUser),
 			},
 		},
@@ -595,6 +656,63 @@ func TestModel_buildChatConfig(t *testing.T) {
 			assert.Equal(t, c.ThinkingConfig, tt.want.ThinkingConfig)
 		})
 	}
+}
+
+func TestModel_buildChatConfig_MaxOutputTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		modelName string
+		maxTokens int
+		want      int32
+	}{
+		{
+			name:      "keeps requested tokens under model cap",
+			modelName: "gemini-2.5-flash",
+			maxTokens: 1024,
+			want:      1024,
+		},
+		{
+			name:      "caps requested tokens at known model limit",
+			modelName: "gemini-2.5-flash",
+			maxTokens: 70000,
+			want:      65536,
+		},
+		{
+			name:      "ignores invalid token count",
+			modelName: "gemini-2.5-flash",
+			maxTokens: 0,
+			want:      0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &model.Request{
+				GenerationConfig: model.GenerationConfig{
+					MaxTokens: &tt.maxTokens,
+				},
+			}
+
+			cfg := (&Model{name: tt.modelName}).buildChatConfig(req)
+
+			require.Equal(t, tt.want, cfg.MaxOutputTokens)
+		})
+	}
+
+	t.Run("caps int overflow at int32 maximum", func(t *testing.T) {
+		if strconv.IntSize == 32 {
+			t.Skip("cannot construct a max token value above int32 on 32-bit platforms")
+		}
+		maxTokens := int(int64(math.MaxInt32) + 1)
+		req := &model.Request{
+			GenerationConfig: model.GenerationConfig{
+				MaxTokens: &maxTokens,
+			},
+		}
+
+		cfg := (&Model{name: "unknown-gemini-model"}).buildChatConfig(req)
+
+		require.Equal(t, int32(math.MaxInt32), cfg.MaxOutputTokens)
+	})
 }
 
 func TestModel_Info(t *testing.T) {
@@ -1060,13 +1178,72 @@ func TestModel_convertMessageContent_InjectsSkipValidatorForCrossProviderFunctio
 
 	contents := (&Model{}).convertMessageContent(message)
 
-	require.Len(t, contents, 2)
+	require.Len(t, contents, 1)
+	require.Equal(t, genai.RoleModel, contents[0].Role)
+	require.Len(t, contents[0].Parts, 2)
 	first := contents[0].Parts[0]
-	second := contents[1].Parts[0]
+	second := contents[0].Parts[1]
 	require.NotNil(t, first.FunctionCall)
 	require.NotNil(t, second.FunctionCall)
 	assert.Equal(t, []byte(geminiSkipThoughtSignatureValidator), first.ThoughtSignature)
 	assert.Empty(t, second.ThoughtSignature)
+}
+
+func TestModel_convertMessageContent_PreservesGeminiParallelFunctionCalls(t *testing.T) {
+	signature := []byte("gemini-thought-signature")
+	args := []byte(`{"city":"Paris"}`)
+	message := model.Message{
+		Role: model.RoleAssistant,
+		ToolCalls: []model.ToolCall{
+			{
+				ID: "call-1",
+				Function: model.FunctionDefinitionParam{
+					Name:      "get_weather",
+					Arguments: args,
+				},
+				ExtraFields: map[string]any{
+					geminiThoughtSignatureKey: signature,
+				},
+			},
+			{
+				ID: "call-2",
+				Function: model.FunctionDefinitionParam{
+					Name:      "get_weather",
+					Arguments: []byte(`{"city":"London"}`),
+				},
+			},
+		},
+	}
+
+	contents := (&Model{}).convertMessageContent(message)
+
+	require.Len(t, contents, 1)
+	require.Len(t, contents[0].Parts, 2)
+	assert.Equal(t, signature, contents[0].Parts[0].ThoughtSignature)
+	assert.Empty(t, contents[0].Parts[1].ThoughtSignature)
+}
+
+func TestModel_convertMessageContent_SkipsInvalidToolCallWhenInjectingBypass(t *testing.T) {
+	args := []byte(`{"command":"echo hi"}`)
+	message := model.Message{
+		Role: model.RoleAssistant,
+		ToolCalls: []model.ToolCall{
+			{Function: model.FunctionDefinitionParam{Name: ""}},
+			{
+				ID: "call-1",
+				Function: model.FunctionDefinitionParam{
+					Name:      "execute_series",
+					Arguments: args,
+				},
+			},
+		},
+	}
+
+	contents := (&Model{}).convertMessageContent(message)
+
+	require.Len(t, contents, 1)
+	require.Len(t, contents[0].Parts, 1)
+	assert.Equal(t, []byte(geminiSkipThoughtSignatureValidator), contents[0].Parts[0].ThoughtSignature)
 }
 
 func TestModel_convertToolCallPart_EdgeCases(t *testing.T) {
@@ -1086,6 +1263,20 @@ func TestModel_convertToolCallPart_EdgeCases(t *testing.T) {
 		require.NotNil(t, part)
 		require.NotNil(t, part.FunctionCall)
 		assert.Empty(t, part.FunctionCall.Args)
+		assert.Equal(t, []byte(geminiSkipThoughtSignatureValidator), part.ThoughtSignature)
+	})
+
+	t.Run("unsigned call without injectBypass stays unsigned", func(t *testing.T) {
+		part := (&Model{}).convertToolCallPart(model.ToolCall{
+			ID: "call-2",
+			Function: model.FunctionDefinitionParam{
+				Name:      "weather",
+				Arguments: []byte(`{"city":"London"}`),
+			},
+		}, false)
+
+		require.NotNil(t, part)
+		assert.Empty(t, part.ThoughtSignature)
 	})
 }
 
@@ -1322,6 +1513,20 @@ func (mr *MockModelsMockRecorder) GenerateContentStream(ctx, model, contents, co
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GenerateContentStream", reflect.TypeOf((*MockModels)(nil).GenerateContentStream), ctx, model, contents, config)
 }
 
+func TestModel_GenerateContent_NoContentAfterConversion(t *testing.T) {
+	m := &Model{name: "gemini-test"}
+	req := &model.Request{
+		Messages: []model.Message{
+			{Role: model.RoleAssistant},
+		},
+	}
+
+	ch, err := m.GenerateContent(context.Background(), req)
+	require.Error(t, err)
+	require.EqualError(t, err, "gemini: no content after message conversion")
+	require.Nil(t, ch)
+}
+
 func TestModel_GenerateContentError(t *testing.T) {
 	subText := "subText"
 	req := &model.Request{
@@ -1379,20 +1584,6 @@ func TestModel_GenerateContentError(t *testing.T) {
 			_, _ = m.GenerateContent(tt.args.ctx, tt.args.request)
 		})
 	}
-}
-
-func TestModel_GenerateContent_NoContentAfterConversion(t *testing.T) {
-	m := &Model{name: "gemini-test"}
-	req := &model.Request{
-		Messages: []model.Message{
-			{Role: model.RoleAssistant},
-		},
-	}
-
-	ch, err := m.GenerateContent(context.Background(), req)
-	require.Error(t, err)
-	require.EqualError(t, err, "gemini: no content after message conversion")
-	require.Nil(t, ch)
 }
 
 func TestModel_GenerateContentNoStream(t *testing.T) {
