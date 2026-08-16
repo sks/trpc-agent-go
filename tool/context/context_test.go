@@ -206,6 +206,41 @@ func TestCheckBudgetTool(t *testing.T) {
 // --- note tests ---
 
 func TestNoteTool(t *testing.T) {
+	t.Run("returns saved note receipt and current budget", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "s3-receipt")
+		sess.Events = []event.Event{
+			newTestEvent("visible"),
+			newTestEvent("masked"),
+		}
+		sess.MaskEvents("masked")
+		ctx := ctxWithSession(sess)
+
+		tool := NewNoteTool()
+		result, err := tool.Call(
+			ctx,
+			[]byte(`{"key":"findings","content":"root cause"}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		out := result.(NoteOutput)
+		if out.Saved == nil {
+			t.Fatal("expected saved note receipt")
+		}
+		if out.Saved.Key != "findings" || out.Saved.Bytes != 10 {
+			t.Fatalf("unexpected saved note receipt: %+v", out.Saved)
+		}
+		if out.Budget == nil {
+			t.Fatal("expected current context budget")
+		}
+		if out.Budget.TotalEvents != 2 ||
+			out.Budget.VisibleEvents != 1 ||
+			out.Budget.MaskedEvents != 1 {
+			t.Fatalf("unexpected context budget: %+v", out.Budget)
+		}
+	})
+
 	t.Run("stores note in session state", func(t *testing.T) {
 		sess := session.NewSession("app", "user", "s3")
 		ctx := ctxWithSession(sess)
