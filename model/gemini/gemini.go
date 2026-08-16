@@ -16,11 +16,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/genai"
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -78,6 +80,14 @@ func New(ctx context.Context, name string, opts ...Option) (*Model, error) {
 	if o.tailoringStrategy == nil {
 		o.tailoringStrategy = model.NewMiddleOutStrategy(o.tokenCounter)
 	}
+	if o.geminiClientConfig == nil {
+		o.geminiClientConfig = &genai.ClientConfig{}
+	}
+	existingExtras := o.geminiClientConfig.HTTPOptions.ExtrasRequestProvider
+	o.geminiClientConfig.HTTPOptions.ExtrasRequestProvider = chainExtrasRequestProvider(
+		existingExtras,
+		rewriteBypassThoughtSignatures,
+	)
 	client, err := genai.NewClient(ctx, o.geminiClientConfig)
 	if err != nil {
 		return nil, err
@@ -172,7 +182,10 @@ func (m *Model) GenerateContent(
 	if len(chatRequest) == 0 {
 		return nil, errors.New("gemini: no content after message conversion")
 	}
-	generateConfig := m.buildChatConfig(request)
+	generateConfig := m.buildChatConfigWithToolControl(
+		request,
+		imodelrequest.ToolsDisabled(ctx),
+	)
 	// Execute callback synchronously before starting the goroutine
 	// to avoid a race where the runner and HTTP handler finish
 	// (closing the SSE writer) while the callback is still running.
@@ -597,34 +610,13 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := m.contextWindow
-		if contextWindow <= 0 {
-			contextWindow = imodel.ResolveContextWindow(m.name)
-		}
-		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.protocolOverheadTokens,
-				m.reserveOutputTokens,
-				m.inputTokensFloor,
-				m.safetyMarginRatio,
-				m.maxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
 		log.DebugfContext(
 			ctx,
 			"auto-calculated max input tokens: model=%s, "+
-				"contextWindow=%d, maxInputTokens=%d",
+				"maxInputTokens=%d",
 			m.name,
-			contextWindow,
 			maxInputTokens,
 		)
 	}
@@ -706,8 +698,37 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	}
 }
 
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
+	}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = imodel.ResolveContextWindow(m.name)
+	}
+	if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.protocolOverheadTokens,
+			m.reserveOutputTokens,
+			m.inputTokensFloor,
+			m.safetyMarginRatio,
+			m.maxInputTokensRatio,
+		)
+	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
+}
+
 // buildChatConfig converts our Request to Gemini request config.
 func (m *Model) buildChatConfig(request *model.Request) *genai.GenerateContentConfig {
+	return m.buildChatConfigWithToolControl(request, false)
+}
+
+func (m *Model) buildChatConfigWithToolControl(
+	request *model.Request,
+	disableToolFields bool,
+) *genai.GenerateContentConfig {
 	chatRequest := &genai.GenerateContentConfig{
 		Tools: m.convertTools(request.Tools),
 	}
@@ -729,8 +750,12 @@ func (m *Model) buildChatConfig(request *model.Request) *genai.GenerateContentCo
 		chatRequest.ResponseJsonSchema = request.StructuredOutput.JSONSchema
 	}
 
-	if mt := model.SanitizeMaxTokensPtr(request.MaxTokens); mt != nil {
-		chatRequest.MaxOutputTokens = int32(*mt)
+	if mt := imodel.ClampMaxTokensForModel(m.name, request.MaxTokens); mt != nil {
+		if *mt > math.MaxInt32 {
+			chatRequest.MaxOutputTokens = math.MaxInt32
+		} else {
+			chatRequest.MaxOutputTokens = int32(*mt)
+		}
 	}
 	if request.Temperature != nil {
 		chatRequest.Temperature = genai.Ptr(float32(*request.Temperature))
@@ -748,7 +773,35 @@ func (m *Model) buildChatConfig(request *model.Request) *genai.GenerateContentCo
 		chatRequest.FrequencyPenalty = genai.Ptr(float32(*request.FrequencyPenalty))
 	}
 	chatRequest.ThinkingConfig = m.buildThinkingConfig(request)
+	var requestExtras genai.ExtrasRequestProvider
+	if chatRequest.HTTPOptions != nil {
+		requestExtras = chatRequest.HTTPOptions.ExtrasRequestProvider
+	}
+	if chatRequest.HTTPOptions == nil {
+		chatRequest.HTTPOptions = &genai.HTTPOptions{}
+	}
+	// go-genai applies ExtrasRequestProvider from the per-request HTTPOptions;
+	// set it here so bypass sentinel rewriting runs on every generateContent call.
+	chatRequest.HTTPOptions.ExtrasRequestProvider = chainExtrasRequestProvider(
+		requestExtras,
+		rewriteBypassThoughtSignatures,
+	)
+	if disableToolFields {
+		chatRequest.Tools = nil
+		chatRequest.ToolConfig = nil
+		chatRequest.HTTPOptions.ExtrasRequestProvider =
+			chainExtrasRequestProvider(
+				chatRequest.HTTPOptions.ExtrasRequestProvider,
+				deleteGeminiToolControls,
+			)
+	}
 	return chatRequest
+}
+
+func deleteGeminiToolControls(body map[string]any) map[string]any {
+	delete(body, "tools")
+	delete(body, "toolConfig")
+	return body
 }
 
 // buildThinkingConfig converts our Request to Gemini request ThinkingConfig
@@ -834,17 +887,46 @@ func (m *Model) convertMessageContent(
 		// For non-file or non-skipped file types, add to contentParts.
 		contentParts = append(contentParts, genai.NewContentFromParts([]*genai.Part{contentPart}, genai.Role(role)))
 	}
-	for i, toolCall := range msg.ToolCalls {
-		contentPart := m.convertToolCallPart(toolCall, i == 0)
-		if contentPart == nil {
-			continue
-		}
-		contentParts = append(contentParts, genai.NewContentFromParts([]*genai.Part{contentPart}, genai.Role(role)))
+	if toolCallParts := m.convertAssistantToolCallParts(msg.ToolCalls); len(toolCallParts) > 0 {
+		contentParts = append(contentParts, genai.NewContentFromParts(toolCallParts, genai.Role(role)))
 	}
 	return contentParts
 }
 
-func (m *Model) convertToolCallPart(toolCall model.ToolCall, isFirstFunctionCallInStep bool) *genai.Part {
+// convertAssistantToolCallParts builds function-call parts for one assistant step.
+// Gemini parallel calls belong in a single model content; bypass signatures apply
+// only when the step has no stored Gemini thought signatures (cross-provider replay).
+func (m *Model) convertAssistantToolCallParts(toolCalls []model.ToolCall) []*genai.Part {
+	needsBypass := assistantStepNeedsBypassSignature(toolCalls)
+	parts := make([]*genai.Part, 0, len(toolCalls))
+	firstEmitted := true
+	for _, toolCall := range toolCalls {
+		injectBypass := needsBypass && firstEmitted
+		part := m.convertToolCallPart(toolCall, injectBypass)
+		if part == nil {
+			continue
+		}
+		firstEmitted = false
+		parts = append(parts, part)
+	}
+	return parts
+}
+
+func assistantStepNeedsBypassSignature(toolCalls []model.ToolCall) bool {
+	hasEmitted := false
+	for _, toolCall := range toolCalls {
+		if toolCall.Function.Name == "" {
+			continue
+		}
+		hasEmitted = true
+		if len(thoughtSignatureFromExtraFields(toolCall.ExtraFields)) > 0 {
+			return false
+		}
+	}
+	return hasEmitted
+}
+
+func (m *Model) convertToolCallPart(toolCall model.ToolCall, injectBypass bool) *genai.Part {
 	if toolCall.Function.Name == "" {
 		return nil
 	}
@@ -865,10 +947,9 @@ func (m *Model) convertToolCallPart(toolCall model.ToolCall, isFirstFunctionCall
 		part.ThoughtSignature = signature
 		return part
 	}
-	// Gemini 3 validates thought_signature on the first functionCall of each step
-	// in the current turn. History replayed from other providers lacks signatures;
-	// the API accepts this documented bypass token for injected function calls.
-	if isFirstFunctionCallInStep {
+	// Cross-provider replay: Gemini 3 requires a bypass sentinel on the first
+	// functionCall part of each step when no real thought_signature is stored.
+	if injectBypass {
 		part.ThoughtSignature = []byte(geminiSkipThoughtSignatureValidator)
 	}
 	return part
@@ -1003,7 +1084,26 @@ func (m *Model) convertContentPart(part model.ContentPart) *genai.Part {
 		if part.Audio == nil {
 			return nil
 		}
-		return genai.NewPartFromBytes(part.Audio.Data, part.Audio.Format)
+		mimeType := mediaMIMEType(part.Audio.Format, "audio")
+		if part.Audio.URL != "" {
+			return genai.NewPartFromURI(part.Audio.URL, mimeType)
+		}
+		if len(part.Audio.Data) == 0 {
+			return nil
+		}
+		return genai.NewPartFromBytes(part.Audio.Data, mimeType)
+	case model.ContentTypeVideo:
+		if part.Video == nil {
+			return nil
+		}
+		mimeType := mediaMIMEType(part.Video.Format, "video")
+		if part.Video.URL != "" {
+			return genai.NewPartFromURI(part.Video.URL, mimeType)
+		}
+		if len(part.Video.Data) == 0 {
+			return nil
+		}
+		return genai.NewPartFromBytes(part.Video.Data, mimeType)
 	case model.ContentTypeFile:
 		if part.File == nil {
 			return nil
@@ -1019,4 +1119,12 @@ func (m *Model) convertContentPart(part model.ContentPart) *genai.Part {
 		return genai.NewPartFromBytes(part.File.Data, part.File.MimeType)
 	}
 	return nil
+}
+
+func mediaMIMEType(format, mediaType string) string {
+	format = strings.TrimSpace(format)
+	if format == "" || strings.Contains(format, "/") {
+		return format
+	}
+	return mediaType + "/" + format
 }

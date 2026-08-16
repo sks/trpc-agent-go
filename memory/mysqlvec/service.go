@@ -123,11 +123,12 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 			opts.extractor, opts.enabledTools,
 		)
 		config := imemory.AutoMemoryConfig{
-			Extractor:        opts.extractor,
-			AsyncMemoryNum:   opts.asyncMemoryNum,
-			MemoryQueueSize:  opts.memoryQueueSize,
-			MemoryJobTimeout: opts.memoryJobTimeout,
-			EnabledTools:     opts.enabledTools,
+			Extractor:                opts.extractor,
+			AsyncMemoryNum:           opts.asyncMemoryNum,
+			MemoryQueueSize:          opts.memoryQueueSize,
+			MemoryJobTimeout:         opts.memoryJobTimeout,
+			DisableOnExternalContext: opts.disableAutoMemoryOnExternalContext,
+			EnabledTools:             opts.enabledTools,
 		}
 		s.autoMemoryWorker = imemory.NewAutoMemoryWorker(config, s)
 		s.autoMemoryWorker.Start()
@@ -264,12 +265,10 @@ func (s *Service) UpdateMemory(
 	selectQuery := fmt.Sprintf(
 		"SELECT memory_id, app_name, user_id, memory_content, topics, "+
 			"memory_kind, event_time, participants, location, "+
-			"created_at, updated_at FROM %s WHERE memory_id = ? AND app_name = ? AND user_id = ?",
+			"created_at, updated_at FROM %s WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+			"AND deleted_at IS NULL",
 		s.tableName,
 	)
-	if s.opts.softDelete {
-		selectQuery += " AND deleted_at IS NULL"
-	}
 
 	var entry *memory.Entry
 	var found bool
@@ -356,12 +355,9 @@ func (s *Service) updateInPlace(
 	updateQuery := fmt.Sprintf(
 		"UPDATE %s SET memory_content = ?, topics = ?, embedding = "+embeddingExpr+", "+
 			"memory_kind = ?, event_time = ?, participants = ?, location = ?, updated_at = ? "+
-			"WHERE memory_id = ? AND app_name = ? AND user_id = ?",
+			"WHERE memory_id = ? AND app_name = ? AND user_id = ? AND deleted_at IS NULL",
 		s.tableName,
 	)
-	if s.opts.softDelete {
-		updateQuery += " AND deleted_at IS NULL"
-	}
 	res, err := s.db.Exec(ctx, updateQuery,
 		memoryStr, string(topicsJSON), embeddingArg,
 		ef.kind, ef.eventTime, ef.participants, ef.location, now,
@@ -380,7 +376,9 @@ func (s *Service) updateInPlace(
 	return nil
 }
 
-// rotateMemory replaces a memory entry with a new ID via DELETE + INSERT in a transaction.
+// rotateMemory replaces a memory entry with a new ID in a transaction.
+//
+//nolint:gosec // All interpolated table names are validated by WithTableName.
 func (s *Service) rotateMemory(
 	ctx context.Context,
 	memoryKey memory.Key,
@@ -392,41 +390,148 @@ func (s *Service) rotateMemory(
 	createdAt time.Time,
 	now time.Time,
 ) error {
-	return s.db.Transaction(ctx, func(tx *sql.Tx) error { // nolint:gosec // table name is validated
-		deleteQuery := fmt.Sprintf(
-			"DELETE FROM %s WHERE memory_id = ? AND app_name = ? AND user_id = ?",
+	return s.db.Transaction(ctx, func(tx *sql.Tx) error {
+		var targetActive bool
+		checkQuery := fmt.Sprintf(
+			"SELECT deleted_at IS NULL FROM %s "+
+				"WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+				"FOR UPDATE",
 			s.tableName,
 		)
-		if s.opts.softDelete {
-			deleteQuery += " AND deleted_at IS NULL"
+		err := tx.QueryRowContext(
+			ctx,
+			checkQuery,
+			newID,
+			memoryKey.AppName,
+			memoryKey.UserID,
+		).Scan(&targetActive)
+
+		insertTarget := false
+		switch {
+		case err == sql.ErrNoRows:
+			insertTarget = true
+		case err != nil:
+			return fmt.Errorf("check rotated memory target: %w", err)
+		case targetActive:
+			return fmt.Errorf("memory with id %s already exists", newID)
+		case s.opts.softDelete:
+			updateTargetQuery := fmt.Sprintf(
+				"UPDATE %s SET memory_content = ?, topics = ?, embedding = "+embeddingExpr+", "+
+					"memory_kind = ?, event_time = ?, participants = ?, location = ?, "+
+					"deleted_at = NULL, updated_at = ? "+
+					"WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+					"AND deleted_at IS NOT NULL",
+				s.tableName,
+			)
+			res, err := tx.ExecContext(
+				ctx,
+				updateTargetQuery,
+				memoryStr,
+				string(topicsJSON),
+				embeddingArg,
+				ef.kind,
+				ef.eventTime,
+				ef.participants,
+				ef.location,
+				now,
+				newID,
+				memoryKey.AppName,
+				memoryKey.UserID,
+			)
+			if err != nil {
+				return fmt.Errorf("revive rotated memory target: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("revive rotated memory target rows affected: %w", err)
+			}
+			if affected == 0 {
+				return fmt.Errorf("memory with id %s not found", newID)
+			}
+		default:
+			deleteTargetQuery := fmt.Sprintf(
+				"DELETE FROM %s WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+					"AND deleted_at IS NOT NULL",
+				s.tableName,
+			)
+			res, err := tx.ExecContext(
+				ctx,
+				deleteTargetQuery,
+				newID,
+				memoryKey.AppName,
+				memoryKey.UserID,
+			)
+			if err != nil {
+				return fmt.Errorf("delete rotated memory target: %w", err)
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("delete rotated memory target rows affected: %w", err)
+			}
+			if affected == 0 {
+				return fmt.Errorf("memory with id %s not found", newID)
+			}
+			insertTarget = true
 		}
-		res, err := tx.ExecContext(ctx, deleteQuery, memoryKey.MemoryID, memoryKey.AppName, memoryKey.UserID)
+
+		if insertTarget {
+			insertQuery := fmt.Sprintf(
+				"INSERT INTO %s (memory_id, app_name, user_id, memory_content, topics, "+
+					"embedding, memory_kind, event_time, participants, location, "+
+					"created_at, updated_at) "+
+					"VALUES (?, ?, ?, ?, ?, "+embeddingExpr+", ?, ?, ?, ?, ?, ?)",
+				s.tableName,
+			)
+			if _, err := tx.ExecContext(
+				ctx,
+				insertQuery,
+				newID,
+				memoryKey.AppName,
+				memoryKey.UserID,
+				memoryStr,
+				string(topicsJSON),
+				embeddingArg,
+				ef.kind,
+				ef.eventTime,
+				ef.participants,
+				ef.location,
+				createdAt,
+				now,
+			); err != nil {
+				return fmt.Errorf("insert rotated memory target: %w", err)
+			}
+		}
+
+		var (
+			query string
+			args  []any
+		)
+		if s.opts.softDelete {
+			query = fmt.Sprintf(
+				"UPDATE %s SET deleted_at = ? "+
+					"WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+					"AND deleted_at IS NULL",
+				s.tableName,
+			)
+			args = []any{now, memoryKey.MemoryID, memoryKey.AppName, memoryKey.UserID}
+		} else {
+			query = fmt.Sprintf(
+				"DELETE FROM %s WHERE memory_id = ? AND app_name = ? AND user_id = ? "+
+					"AND deleted_at IS NULL",
+				s.tableName,
+			)
+			args = []any{memoryKey.MemoryID, memoryKey.AppName, memoryKey.UserID}
+		}
+		res, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return fmt.Errorf("delete rotated memory: %w", err)
+			return fmt.Errorf("remove rotated memory source: %w", err)
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
-			return fmt.Errorf("delete rotated memory rows affected: %w", err)
+			return fmt.Errorf("remove rotated memory source rows affected: %w", err)
 		}
 		if affected == 0 {
 			return fmt.Errorf("memory with id %s not found", memoryKey.MemoryID)
-		}
-
-		insertQuery := fmt.Sprintf(
-			"INSERT INTO %s (memory_id, app_name, user_id, memory_content, topics, "+
-				"embedding, memory_kind, event_time, participants, location, "+
-				"created_at, updated_at) "+
-				"VALUES (?, ?, ?, ?, ?, "+embeddingExpr+", ?, ?, ?, ?, ?, ?)",
-			s.tableName,
-		)
-		_, err = tx.ExecContext(ctx, insertQuery,
-			newID, memoryKey.AppName, memoryKey.UserID,
-			memoryStr, string(topicsJSON), embeddingArg,
-			ef.kind, ef.eventTime, ef.participants, ef.location,
-			createdAt, now,
-		)
-		if err != nil {
-			return fmt.Errorf("insert rotated memory: %w", err)
 		}
 		return nil
 	})

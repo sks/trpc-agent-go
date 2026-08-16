@@ -29,6 +29,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 	"trpc.group/trpc-go/trpc-agent-go/internal/jsonrepair"
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -40,7 +41,14 @@ import (
 const (
 	functionToolType       = "function"
 	claudeMythosPreview    = "claude-mythos-preview"
+	claudeFable5           = "claude-fable-5"
+	claudeMythos5          = "claude-mythos-5"
+	claudeOpus5            = "claude-opus-5"
+	claudeSonnet5          = "claude-sonnet-5"
+	claudeOpus48           = "claude-opus-4-8"
+	claudeOpus48Alias      = "claude-4.8-opus"
 	claudeOpus47           = "claude-opus-4-7"
+	claudeOpus47Alias      = "claude-4.7-opus"
 	claudeOpus46           = "claude-opus-4-6"
 	claudeOpus46Alias      = "claude-4.6-opus"
 	claudeSonnet46         = "claude-sonnet-4-6"
@@ -162,6 +170,37 @@ func (m *Model) runChatRequestCallback(
 	m.chatRequestCallback(ctx, chatRequest)
 }
 
+func disableChatRequestTools(request *anthropic.MessageNewParams) {
+	if request == nil {
+		return
+	}
+	request.Tools = nil
+	request.ToolChoice = anthropic.ToolChoiceUnionParam{}
+	if override, ok := request.Overrides(); ok {
+		if filtered, ok := imodelrequest.FilterToolControlObject(override); ok {
+			request.SetExtraFields(filtered)
+		}
+		return
+	}
+	if fields := request.ExtraFields(); len(fields) > 0 {
+		request.SetExtraFields(
+			imodelrequest.FilterToolControlFields(fields, true),
+		)
+	}
+}
+
+func (m *Model) requestOptions(ctx context.Context) []option.RequestOption {
+	if !imodelrequest.ToolsDisabled(ctx) {
+		return m.anthropicRequestOptions
+	}
+	opts := append([]option.RequestOption(nil), m.anthropicRequestOptions...)
+	return append(
+		opts,
+		option.WithJSONDel("tools"),
+		option.WithJSONDel("tool_choice"),
+	)
+}
+
 func (m *Model) runChatResponseCallback(
 	ctx context.Context,
 	chatRequest *anthropic.MessageNewParams,
@@ -219,6 +258,9 @@ func (m *Model) GenerateContent(
 	// to avoid a race where the runner and HTTP handler finish
 	// (closing the SSE writer) while the callback is still running.
 	m.runChatRequestCallback(ctx, chatRequest)
+	if imodelrequest.ToolsDisabled(ctx) {
+		disableChatRequestTools(chatRequest)
+	}
 	// Send chat request and handle response.
 	responseChan := make(chan *model.Response, m.channelBufferSize)
 	go func() {
@@ -240,34 +282,13 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 		return
 	}
 
-	// Determine max input tokens using priority: user config > auto calculation > default.
-	maxInputTokens := m.maxInputTokens
-	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with custom or default parameters.
-		contextWindow := m.contextWindow
-		if contextWindow <= 0 {
-			contextWindow = imodel.ResolveContextWindow(m.name)
-		}
-		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
-			// Use custom parameters if any are set.
-			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
-				contextWindow,
-				m.protocolOverheadTokens,
-				m.reserveOutputTokens,
-				m.inputTokensFloor,
-				m.safetyMarginRatio,
-				m.maxInputTokensRatio,
-			)
-		} else {
-			// Use default parameters.
-			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
-		}
+	maxInputTokens := m.InputTokenBudget(ctx, request)
+	if m.maxInputTokens <= 0 {
 		log.DebugfContext(
 			ctx,
 			"auto-calculated max input tokens: model=%s, "+
-				"contextWindow=%d, maxInputTokens=%d",
+				"maxInputTokens=%d",
 			m.name,
-			contextWindow,
 			maxInputTokens,
 		)
 	}
@@ -293,6 +314,28 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	}
 
 	modeltailoring.ApplyResult(ctx, "anthropic.Model", request, tailored)
+}
+
+// InputTokenBudget returns the same input budget used by token tailoring.
+func (m *Model) InputTokenBudget(_ context.Context, _ *model.Request) int {
+	if m.maxInputTokens > 0 {
+		return m.maxInputTokens
+	}
+	contextWindow := m.contextWindow
+	if contextWindow <= 0 {
+		contextWindow = imodel.ResolveContextWindow(m.name)
+	}
+	if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+		return imodel.CalculateMaxInputTokensWithParams(
+			contextWindow,
+			m.protocolOverheadTokens,
+			m.reserveOutputTokens,
+			m.inputTokensFloor,
+			m.safetyMarginRatio,
+			m.maxInputTokensRatio,
+		)
+	}
+	return imodel.CalculateMaxInputTokens(contextWindow)
 }
 
 // buildChatRequest builds the chat request for the Anthropic API.
@@ -330,12 +373,12 @@ func (m *Model) buildChatRequest(request *model.Request) (*anthropic.MessageNewP
 	if request.GenerationConfig.MaxTokens == nil && m.explicitMaxTokens != nil {
 		request.GenerationConfig.MaxTokens = m.explicitMaxTokens
 	}
-	if request.GenerationConfig.MaxTokens != nil {
-		chatRequest.MaxTokens = int64(*request.GenerationConfig.MaxTokens)
+	if mt := imodel.ClampMaxTokensForModel(m.name, request.MaxTokens); mt != nil {
+		chatRequest.MaxTokens = int64(*mt)
 	}
 	// Anthropic requires max_tokens >= model.MinValidCompletionTokens. Apply the
 	// same default when unset or invalid; token tailoring only trims input.
-	if chatRequest.MaxTokens < int64(model.MinValidCompletionTokens) {
+	if chatRequest.MaxTokens < int64(imodel.MinValidCompletionTokens) {
 		chatRequest.MaxTokens = 4096
 	}
 	if request.Temperature != nil {
@@ -361,7 +404,7 @@ func (m *Model) applyThinkingConfig(
 		return nil
 	}
 	if !*request.ThinkingEnabled {
-		if isClaudeMythosPreview(m.name) {
+		if isAlwaysThinking(m.name) {
 			return fmt.Errorf("anthropic: thinking cannot be disabled for model %s", m.name)
 		}
 		if !supportsAdaptiveThinking(m.name) {
@@ -397,7 +440,14 @@ func supportsAdaptiveThinking(modelName string) bool {
 	return modelNameMatches(
 		modelName,
 		claudeMythosPreview,
+		claudeFable5,
+		claudeMythos5,
+		claudeOpus5,
+		claudeSonnet5,
+		claudeOpus48,
+		claudeOpus48Alias,
 		claudeOpus47,
+		claudeOpus47Alias,
 		claudeOpus46,
 		claudeOpus46Alias,
 		claudeSonnet46,
@@ -405,8 +455,12 @@ func supportsAdaptiveThinking(modelName string) bool {
 	)
 }
 
-func isClaudeMythosPreview(modelName string) bool {
-	return modelNameMatches(modelName, claudeMythosPreview)
+// isAlwaysThinking reports whether a model thinks unconditionally, so that
+// `thinking.type=disabled` is not merely ignored but rejected by the API.
+// Sending it for one of these turns a caller's explicit ThinkingEnabled=false
+// into a 400, so the request is refused here with a message naming the model.
+func isAlwaysThinking(modelName string) bool {
+	return modelNameMatches(modelName, claudeMythosPreview, claudeFable5, claudeMythos5)
 }
 
 func modelNameMatches(modelName string, targets ...string) bool {
@@ -550,7 +604,7 @@ func (m *Model) handleNonStreamingResponse(
 	responseChan chan<- *model.Response,
 ) {
 	// Issue non-streaming request.
-	message, err := m.client.Messages.New(ctx, chatRequest, m.anthropicRequestOptions...)
+	message, err := m.client.Messages.New(ctx, chatRequest, m.requestOptions(ctx)...)
 	if err != nil {
 		m.sendErrorResponse(ctx, responseChan, model.ErrorTypeAPIError, err)
 		return
@@ -702,7 +756,8 @@ func (m *Model) runStreamingAttempt(
 	chatRequest anthropic.MessageNewParams,
 	responseChan chan<- *model.Response,
 ) (finalResponse *model.Response, callbackAcc *anthropic.Message, streamErr error, sawContent bool) {
-	stream := m.client.Messages.NewStreaming(ctx, chatRequest, m.anthropicRequestOptions...)
+	stream := m.client.Messages.NewStreaming(ctx, chatRequest, m.requestOptions(ctx)...)
+
 	defer stream.Close()
 	acc := newStreamingMessageAccumulator()
 	var pendingChunkCallbacks []anthropic.MessageStreamEventUnion

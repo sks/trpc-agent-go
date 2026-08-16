@@ -11,6 +11,7 @@ package llmflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -28,10 +29,13 @@ import (
 	atrace "trpc.group/trpc-go/trpc-agent-go/agent/trace"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/calllimit"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
+	imodelrequest "trpc.group/trpc-go/trpc-agent-go/internal/modelrequest"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/steer"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryfork"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
+	"trpc.group/trpc-go/trpc-agent-go/internal/tracecapture"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/plugin"
@@ -152,6 +156,25 @@ func flowHasAttr(attrs []attribute.KeyValue, key string, want any) bool {
 		}
 	}
 	return false
+}
+
+func lastFlowAttrStringValue(attrs []attribute.KeyValue, key string) (string, bool) {
+	for i := len(attrs) - 1; i >= 0; i-- {
+		if string(attrs[i].Key) == key {
+			return attrs[i].Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+func flowCountAttr(attrs []attribute.KeyValue, key string) int {
+	count := 0
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLatencyDiagnosticHelpers(t *testing.T) {
@@ -371,7 +394,7 @@ func TestPreprocess_DowngradesOrphanToolCallBeforeModel(t *testing.T) {
 	ch := make(chan *event.Event, 4)
 
 	f.preprocess(context.Background(), inv, req, ch)
-	_, seq, err := f.callLLM(context.Background(), inv, req, inv.Model)
+	_, seq, _, err := f.callLLM(context.Background(), inv, req, inv.Model)
 	require.NoError(t, err)
 	seq(func(resp *model.Response) bool { return false })
 
@@ -586,6 +609,119 @@ func TestProcessStreamingResponses_RepairsToolCallArgumentsWhenEnabled(t *testin
 	require.Equal(t, "{\"a\":2}", string(response.Choices[0].Message.ToolCalls[0].Function.Arguments))
 }
 
+func TestProcessStreamingResponses_RejectsEmptyCompletedToolCallNameBeforeEmit(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation(agent.WithInvocationID("inv-empty-tool-name"))
+	response := &model.Response{
+		Done: true,
+		Choices: []model.Choice{
+			{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{
+						{
+							ID: "call-empty-name",
+							Function: model.FunctionDefinitionParam{
+								Arguments: []byte(`{"command":"pwd"}`),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	responseSeq := func(yield func(*model.Response) bool) {
+		yield(response)
+	}
+
+	eventChan := make(chan *event.Event, 1)
+	tracer := oteltrace.NewNoopTracerProvider().Tracer("t")
+	ctx, span := tracer.Start(context.Background(), "s")
+	defer span.End()
+
+	lastEvent, err := f.processStreamingResponses(
+		ctx,
+		inv,
+		nil,
+		&model.Request{},
+		responseSeq,
+		eventChan,
+		span,
+		true,
+	)
+	require.ErrorContains(t, err, "tool call function name is empty")
+	require.ErrorContains(t, err, `id="call-empty-name"`)
+	require.Nil(t, lastEvent)
+	require.Empty(t, eventChan)
+}
+
+func TestValidateCompletedToolCallNames(t *testing.T) {
+	validCall := model.ToolCall{
+		ID: "call-valid",
+		Function: model.FunctionDefinitionParam{
+			Name:      "shell",
+			Arguments: []byte(`{"command":"pwd"}`),
+		},
+	}
+	emptyCall := validCall
+	emptyCall.ID = "call-empty"
+	emptyCall.Function.Name = " \t"
+
+	tests := []struct {
+		name     string
+		response *model.Response
+		wantErr  bool
+	}{
+		{name: "nil response"},
+		{
+			name: "partial response may have incomplete name",
+			response: &model.Response{
+				IsPartial: true,
+				Choices: []model.Choice{{
+					Delta: model.Message{ToolCalls: []model.ToolCall{emptyCall}},
+				}},
+			},
+		},
+		{
+			name: "completed message with valid name",
+			response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{ToolCalls: []model.ToolCall{validCall}},
+				}},
+			},
+		},
+		{
+			name: "completed message with empty name",
+			response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{ToolCalls: []model.ToolCall{emptyCall}},
+				}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "completed delta with empty name",
+			response: &model.Response{
+				Choices: []model.Choice{{
+					Delta: model.Message{ToolCalls: []model.ToolCall{emptyCall}},
+				}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCompletedToolCallNames(tt.response)
+			if tt.wantErr {
+				require.ErrorContains(t, err, "tool call function name is empty")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestRunOneStep_DisableTracingSkipsSpanCreation(t *testing.T) {
 	recorder := useSpanRecorder(t)
 	f := New([]flow.RequestProcessor{&seedMessagesRequestProcessor{
@@ -614,7 +750,28 @@ func TestRunOneStep_DisableTracingSkipsSpanCreation(t *testing.T) {
 	require.Empty(t, recorder.Ended())
 }
 
-func TestRunOneStep_RecordsExecutionTraceStepOnSuccess(t *testing.T) {
+func ensureInvocationTraceStepForTest(
+	inv *agent.Invocation,
+	input string,
+) tracecapture.StepLease {
+	nodeID := agent.InvocationTraceNodeID(inv)
+	traceCtx := agent.NewInvocationContext(context.Background(), inv)
+	lease := tracecapture.EnsureInvocationStep(
+		traceCtx,
+		func() string {
+			return agent.StartExecutionTraceStep(
+				inv,
+				nodeID,
+				&atrace.Snapshot{Text: input},
+				nil,
+			)
+		},
+	)
+	tracecapture.SetStepNodeType(traceCtx, lease.StepID, "llm")
+	return lease
+}
+
+func TestRunOneStep_UpdatesCurrentExecutionTraceStepOnSuccess(t *testing.T) {
 	f := New(
 		[]flow.RequestProcessor{
 			&seedMessagesRequestProcessor{
@@ -630,6 +787,11 @@ func TestRunOneStep_RecordsExecutionTraceStepOnSuccess(t *testing.T) {
 			responses: []*model.Response{
 				{
 					Done: true,
+					Usage: &model.Usage{
+						PromptTokens:     2,
+						CompletionTokens: 3,
+						TotalTokens:      5,
+					},
 					Choices: []model.Choice{
 						{Message: model.NewAssistantMessage("ok")},
 					},
@@ -639,7 +801,12 @@ func TestRunOneStep_RecordsExecutionTraceStepOnSuccess(t *testing.T) {
 		agent.WithInvocationRunOptions(agent.RunOptions{ExecutionTraceEnabled: true}),
 	)
 	eventChan := make(chan *event.Event, 8)
+	lease := ensureInvocationTraceStepForTest(inv, "entry")
+	require.True(t, lease.Owns)
 	lastEvent, err := f.runOneStep(context.Background(), inv, eventChan)
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+	lastEvent, err = f.runOneStep(context.Background(), inv, eventChan)
 	require.NoError(t, err)
 	require.NotNil(t, lastEvent)
 	executionTrace := agent.BuildExecutionTrace(inv, atrace.TraceStatusCompleted)
@@ -649,11 +816,152 @@ func TestRunOneStep_RecordsExecutionTraceStepOnSuccess(t *testing.T) {
 	require.Equal(t, inv.InvocationID, step.InvocationID)
 	require.Equal(t, "a", step.NodeID)
 	require.NotNil(t, step.Input)
-	require.NotNil(t, step.Output)
 	require.Contains(t, step.Input.Text, "trace me")
-	require.Contains(t, step.Output.Text, "ok")
+	require.Nil(t, step.Output, "runOneStep must not finish the node-level step")
+	require.True(t, step.EndedAt.IsZero())
 	require.Empty(t, step.PredecessorStepIDs)
 	require.Empty(t, step.Error)
+	require.Equal(t, 4, step.Usage.PromptTokens)
+	require.Equal(t, 6, step.Usage.CompletionTokens)
+	require.Equal(t, 10, step.Usage.TotalTokens)
+	agent.FinishExecutionTraceStep(inv, lease.StepID, nil, nil)
+	tracecapture.ReleaseInvocationStep(lease)
+}
+
+func TestRunOneStep_RecordsUsageBeforeReturningProcessError(t *testing.T) {
+	f := New(
+		[]flow.RequestProcessor{&seedMessagesRequestProcessor{
+			messages: []model.Message{model.NewUserMessage("trace me")},
+		}},
+		nil,
+		Options{ModelCallbacks: model.NewCallbacks().RegisterAfterModel(
+			func(
+				context.Context,
+				*model.AfterModelArgs,
+			) (*model.AfterModelResult, error) {
+				return nil, errors.New("after-model failed")
+			},
+		)},
+	)
+	inv := agent.NewInvocation(
+		agent.WithInvocationAgent(&minimalAgent{}),
+		agent.WithInvocationModel(&mockModel{responses: []*model.Response{{
+			Done: true,
+			Usage: &model.Usage{
+				PromptTokens:     2,
+				CompletionTokens: 3,
+				TotalTokens:      5,
+			},
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("unused")}},
+		}}}),
+		agent.WithInvocationRunOptions(agent.RunOptions{ExecutionTraceEnabled: true}),
+	)
+	lease := ensureInvocationTraceStepForTest(inv, "entry")
+	require.True(t, lease.Owns)
+
+	lastEvent, err := f.runOneStep(
+		context.Background(),
+		inv,
+		make(chan *event.Event, 8),
+	)
+	require.Error(t, err)
+	require.Nil(t, lastEvent)
+	executionTrace := agent.BuildExecutionTrace(inv, atrace.TraceStatusFailed)
+	require.Len(t, executionTrace.Steps, 1)
+	require.NotNil(t, executionTrace.Steps[0].Usage)
+	require.Equal(t, 2, executionTrace.Steps[0].Usage.PromptTokens)
+	require.Equal(t, 3, executionTrace.Steps[0].Usage.CompletionTokens)
+	require.Equal(t, 5, executionTrace.Steps[0].Usage.TotalTokens)
+
+	agent.FinishExecutionTraceStep(inv, lease.StepID, nil, err)
+	tracecapture.ReleaseInvocationStep(lease)
+}
+
+func TestRunOneStep_TraceCapturesRequestAfterBeforeModelCallback(t *testing.T) {
+	callbacks := model.NewCallbacks().RegisterBeforeModel(
+		func(
+			ctx context.Context,
+			args *model.BeforeModelArgs,
+		) (*model.BeforeModelResult, error) {
+			_ = ctx
+			args.Request.Messages = []model.Message{
+				model.NewUserMessage("after callback"),
+			}
+			return nil, nil
+		},
+	)
+	f := New(
+		[]flow.RequestProcessor{&seedMessagesRequestProcessor{
+			messages: []model.Message{model.NewUserMessage("before callback")},
+		}},
+		nil,
+		Options{ModelCallbacks: callbacks},
+	)
+	inv := agent.NewInvocation(
+		agent.WithInvocationAgent(&minimalAgent{}),
+		agent.WithInvocationModel(&mockModel{responses: []*model.Response{{
+			Done: true,
+			Usage: &model.Usage{
+				PromptTokens: 1,
+				TotalTokens:  1,
+			},
+			Choices: []model.Choice{{Message: model.NewAssistantMessage("ok")}},
+		}}}),
+		agent.WithInvocationRunOptions(agent.RunOptions{ExecutionTraceEnabled: true}),
+	)
+	lease := ensureInvocationTraceStepForTest(inv, "entry")
+	require.True(t, lease.Owns)
+
+	lastEvent, err := f.runOneStep(context.Background(), inv, make(chan *event.Event, 8))
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+	trace := agent.BuildExecutionTrace(inv, atrace.TraceStatusCompleted)
+	require.Len(t, trace.Steps, 1)
+	require.Contains(t, trace.Steps[0].Input.Text, "after callback")
+	require.NotContains(t, trace.Steps[0].Input.Text, "before callback")
+	require.Equal(t, 1, trace.Steps[0].Usage.TotalTokens)
+
+	agent.FinishExecutionTraceStep(inv, lease.StepID, nil, nil)
+	tracecapture.ReleaseInvocationStep(lease)
+}
+
+func TestRunOneStep_BeforeModelCustomResponseKeepsEntryTraceData(t *testing.T) {
+	callbacks := model.NewCallbacks().RegisterBeforeModel(
+		func(context.Context, *model.Request) (*model.Response, error) {
+			return &model.Response{
+				Done:    true,
+				Usage:   &model.Usage{TotalTokens: 99},
+				Choices: []model.Choice{{Message: model.NewAssistantMessage("custom")}},
+			}, nil
+		},
+	)
+	f := New(
+		[]flow.RequestProcessor{&seedMessagesRequestProcessor{
+			messages: []model.Message{model.NewUserMessage("never sent")},
+		}},
+		nil,
+		Options{ModelCallbacks: callbacks},
+	)
+	callModel := &captureModel{}
+	inv := agent.NewInvocation(
+		agent.WithInvocationAgent(&minimalAgent{}),
+		agent.WithInvocationModel(callModel),
+		agent.WithInvocationRunOptions(agent.RunOptions{ExecutionTraceEnabled: true}),
+	)
+	lease := ensureInvocationTraceStepForTest(inv, "entry")
+	require.True(t, lease.Owns)
+
+	lastEvent, err := f.runOneStep(context.Background(), inv, make(chan *event.Event, 8))
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+	require.False(t, callModel.called)
+	trace := agent.BuildExecutionTrace(inv, atrace.TraceStatusCompleted)
+	require.Len(t, trace.Steps, 1)
+	require.Equal(t, "entry", trace.Steps[0].Input.Text)
+	require.Nil(t, trace.Steps[0].Usage)
+
+	agent.FinishExecutionTraceStep(inv, lease.StepID, nil, nil)
+	tracecapture.ReleaseInvocationStep(lease)
 }
 
 func TestRunOneStep_AttachesCacheSafeSummaryForkRequest(t *testing.T) {
@@ -699,7 +1007,7 @@ func TestRunOneStep_AttachesCacheSafeSummaryForkRequest(t *testing.T) {
 	)
 }
 
-func TestRunOneStep_RecordsExecutionTraceStepErrorWhenModelFails(t *testing.T) {
+func TestRunOneStep_LeavesExecutionTraceFinalizationToOwnerWhenModelFails(t *testing.T) {
 	f := New(
 		[]flow.RequestProcessor{
 			&seedMessagesRequestProcessor{
@@ -715,6 +1023,8 @@ func TestRunOneStep_RecordsExecutionTraceStepErrorWhenModelFails(t *testing.T) {
 		agent.WithInvocationRunOptions(agent.RunOptions{ExecutionTraceEnabled: true}),
 	)
 	eventChan := make(chan *event.Event, 8)
+	lease := ensureInvocationTraceStepForTest(inv, "entry")
+	require.True(t, lease.Owns)
 	lastEvent, err := f.runOneStep(context.Background(), inv, eventChan)
 	require.Error(t, err)
 	require.Nil(t, lastEvent)
@@ -725,7 +1035,10 @@ func TestRunOneStep_RecordsExecutionTraceStepErrorWhenModelFails(t *testing.T) {
 	require.NotNil(t, step.Input)
 	require.Contains(t, step.Input.Text, "trace failure")
 	require.Nil(t, step.Output)
-	require.Contains(t, step.Error, "mock model error")
+	require.Empty(t, step.Error, "runOneStep must not finish the node-level step")
+	require.True(t, step.EndedAt.IsZero())
+	agent.FinishExecutionTraceStep(inv, lease.StepID, nil, err)
+	tracecapture.ReleaseInvocationStep(lease)
 }
 
 func TestProcessStreamingResponses_UsesInvocationFromContextForResponseOptions(t *testing.T) {
@@ -859,6 +1172,53 @@ func TestProcessStreamingResponses_DisableResponseUsageTrackingStillRecordsMetri
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 	require.NotEmpty(t, rm.ScopeMetrics)
+}
+
+func TestObservabilityInvocationViewsExcludeState(t *testing.T) {
+	const stateKey = "benchmark:large-state"
+	baseModel := &mockModel{}
+	selectedModel := &mockIterModel{}
+	baseSession := &session.Session{
+		ID:      "session-base",
+		UserID:  "user-base",
+		AppName: "app-base",
+	}
+	base := agent.NewInvocation(
+		agent.WithInvocationID("invocation-base"),
+		agent.WithInvocationModel(baseModel),
+		agent.WithInvocationSession(baseSession),
+	)
+	base.AgentName = "agent-base"
+	base.SetState(stateKey, make([]byte, 1024))
+
+	callView := observabilityInvocationForModel(base, selectedModel)
+	require.NotSame(t, base, callView)
+	require.Equal(t, base.InvocationID, callView.InvocationID)
+	require.Equal(t, base.AgentName, callView.AgentName)
+	require.Same(t, baseSession, callView.Session)
+	require.Same(t, selectedModel, callView.Model)
+	_, ok := agent.GetStateValue[[]byte](callView, stateKey)
+	require.False(t, ok)
+
+	require.Same(t, callView, observabilityInvocationForCurrent(base, callView))
+	updatedSession := &session.Session{
+		ID:      "session-updated",
+		UserID:  "user-updated",
+		AppName: "app-updated",
+	}
+	updated := agent.NewInvocation(
+		agent.WithInvocationID("invocation-updated"),
+		agent.WithInvocationModel(baseModel),
+		agent.WithInvocationSession(updatedSession),
+	)
+	updated.AgentName = "agent-updated"
+	updatedView := observabilityInvocationForCurrent(updated, callView)
+	require.Equal(t, base.InvocationID, updatedView.InvocationID)
+	require.Equal(t, base.AgentName, updatedView.AgentName)
+	require.Same(t, updatedSession, updatedView.Session)
+	require.Same(t, selectedModel, updatedView.Model)
+	_, ok = agent.GetStateValue[[]byte](updatedView, stateKey)
+	require.False(t, ok)
 }
 
 func TestProcessStreamingResponses_UsesStableInvocationForMetricsMetadata(t *testing.T) {
@@ -1195,6 +1555,122 @@ func TestProcessStreamingResponses_UsesUpdatedInvocationForResponseUsageTiming(t
 	require.NotNil(t, lastEvent)
 	require.NotNil(t, response1.Usage)
 	require.Nil(t, response2.Usage)
+}
+
+func TestProcessStreamingResponses_RequestAttributeStateIgnoresLaterModelMutation(t *testing.T) {
+	var callbackCount int
+	f := New(nil, nil, Options{
+		ModelCallbacks: model.NewCallbacks().RegisterAfterModel(
+			func(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+				callbackCount++
+				if callbackCount == 2 {
+					args.Request.Messages[0].Content = "bbbb" // Same length, different bytes.
+				}
+				return &model.AfterModelResult{}, nil
+			},
+		),
+	})
+	invocation := agent.NewInvocation(agent.WithInvocationID("inv-request-attribute-state"))
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("aaaa")},
+	}
+	responseSeq := func(yield func(*model.Response) bool) {
+		yield(&model.Response{
+			IsPartial: true,
+			Choices: []model.Choice{{
+				Delta: model.Message{Role: model.RoleAssistant, Content: "partial"},
+			}},
+		})
+		yield(&model.Response{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("done"),
+			}},
+		})
+	}
+	eventChan := make(chan *event.Event, 10)
+	span := newFlowRecordingSpan()
+
+	lastEvent, err := f.processStreamingResponses(
+		context.Background(),
+		invocation,
+		nil,
+		req,
+		responseSeq,
+		eventChan,
+		span,
+		true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+
+	inputJSON, ok := lastFlowAttrStringValue(span.attrs, semconvtrace.KeyGenAIInputMessages)
+	require.True(t, ok, "missing input message trace attribute")
+	var messages []struct {
+		Content string `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(inputJSON), &messages))
+	require.Len(t, messages, 1)
+	require.Equal(t, "aaaa", messages[0].Content)
+}
+
+func TestProcessStreamingResponses_RequestAttributeStateCapturesFirstAfterModelMutation(t *testing.T) {
+	var callbackCount int
+	f := New(nil, nil, Options{
+		ModelCallbacks: model.NewCallbacks().RegisterAfterModel(
+			func(ctx context.Context, args *model.AfterModelArgs) (*model.AfterModelResult, error) {
+				callbackCount++
+				if callbackCount == 1 {
+					args.Request.Messages[0].Content = "bbbb" // Same length, different bytes.
+				}
+				return &model.AfterModelResult{}, nil
+			},
+		),
+	})
+	invocation := agent.NewInvocation(agent.WithInvocationID("inv-request-first-chunk-mutation"))
+	req := &model.Request{
+		Messages: []model.Message{model.NewUserMessage("aaaa")},
+	}
+	responseSeq := func(yield func(*model.Response) bool) {
+		yield(&model.Response{
+			IsPartial: true,
+			Choices: []model.Choice{{
+				Delta: model.Message{Role: model.RoleAssistant, Content: "partial"},
+			}},
+		})
+		yield(&model.Response{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("done"),
+			}},
+		})
+	}
+	eventChan := make(chan *event.Event, 10)
+	span := newFlowRecordingSpan()
+
+	lastEvent, err := f.processStreamingResponses(
+		context.Background(),
+		invocation,
+		nil,
+		req,
+		responseSeq,
+		eventChan,
+		span,
+		true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+	require.Equal(t, 2, callbackCount)
+
+	inputJSON, ok := lastFlowAttrStringValue(span.attrs, semconvtrace.KeyGenAIInputMessages)
+	require.True(t, ok, "missing input message trace attribute")
+	var messages []struct {
+		Content string `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(inputJSON), &messages))
+	require.Len(t, messages, 1)
+	require.Equal(t, "bbbb", messages[0].Content)
+	require.Equal(t, 1, flowCountAttr(span.attrs, semconvtrace.KeyGenAIInputMessages))
 }
 
 func TestProcessStreamingResponses_AttachesTimingInfoBeforeAfterModelCallbacks(t *testing.T) {
@@ -1831,7 +2307,6 @@ func testLLMRequest() *model.Request {
 		Messages: []model.Message{model.NewUserMessage("test")},
 	}
 }
-
 
 func newRunFlow(respProcessors []flow.ResponseProcessor, opts ...Options) *Flow {
 	opt := Options{}
@@ -2802,12 +3277,317 @@ func TestFlow_CallLLM_MaxLLMCallsExceeded(t *testing.T) {
 	)
 	inv.MaxLLMCalls = 1
 
-	_, _, err := f.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
+	_, _, _, err := f.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
 	require.NoError(t, err)
 
-	_, _, err = f.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
+	_, _, _, err = f.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "max LLM calls (1) exceeded")
+}
+
+func TestFlow_CallLLM_FinalizesOnLastAllowedCall(t *testing.T) {
+	instruction := "finish with the available context"
+	callbacks := model.NewCallbacks().
+		RegisterBeforeModel(
+			func(
+				ctx context.Context,
+				args *model.BeforeModelArgs,
+			) (*model.BeforeModelResult, error) {
+				require.True(t, imodelrequest.ToolsDisabled(ctx))
+				require.Nil(t, args.Request.Tools)
+				require.NotContains(t, args.Request.ExtraFields, "tool_choice")
+				require.Equal(t, "value", args.Request.ExtraFields["keep"])
+				require.Len(t, args.Request.Messages, 3)
+				require.Equal(t, "base instruction", args.Request.Messages[0].Content)
+				require.Equal(t, model.RoleUser, args.Request.Messages[2].Role)
+				require.Equal(t, instruction, args.Request.Messages[2].Content)
+
+				// Finalization remains tool-free even if a callback attempts
+				// to restore tools and replaces the callback context.
+				args.Request.Tools = map[string]tool.Tool{
+					"lookup": &mockLongRunnerTool{name: "lookup"},
+				}
+				args.Request.ExtraFields["tool_choice"] = "required"
+				return &model.BeforeModelResult{
+					Context: context.Background(),
+				}, nil
+			},
+		).
+		RegisterBeforeModel(
+			func(
+				ctx context.Context,
+				args *model.BeforeModelArgs,
+			) (*model.BeforeModelResult, error) {
+				require.True(t, imodelrequest.ToolsDisabled(ctx))
+				require.Nil(t, args.Request.Tools)
+				require.NotContains(t, args.Request.ExtraFields, "tool_choice")
+
+				args.Request.Tools = map[string]tool.Tool{
+					"lookup": &mockLongRunnerTool{name: "lookup"},
+				}
+				args.Request.ExtraFields["tool_choice"] = "required"
+				return nil, nil
+			},
+		)
+	f := New(nil, nil, Options{ModelCallbacks: callbacks})
+	modelStub := &mockModel{
+		responses: []*model.Response{{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("final"),
+			}},
+		}},
+	}
+	inv := agent.NewInvocation(agent.WithInvocationModel(modelStub))
+	inv.MaxLLMCalls = 1
+	calllimit.Configure(inv, &instruction, nil)
+	req := &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage("base instruction"),
+			model.NewUserMessage("question"),
+		},
+		Tools: map[string]tool.Tool{
+			"lookup": &mockLongRunnerTool{name: "lookup"},
+		},
+		ExtraFields: map[string]any{
+			"tool_choice": "required",
+			"keep":        "value",
+		},
+	}
+
+	gotCtx, seq, modelCalled, err := f.callLLM(
+		context.Background(),
+		inv,
+		req,
+		inv.Model,
+	)
+
+	require.NoError(t, err)
+	require.True(t, modelCalled)
+	require.NotNil(t, seq)
+	require.True(t, imodelrequest.ToolsDisabled(gotCtx))
+	require.Nil(t, req.Tools)
+	require.NotContains(t, req.ExtraFields, "tool_choice")
+	require.Equal(t, "value", req.ExtraFields["keep"])
+	require.Equal(t, "base instruction", req.Messages[0].Content)
+	require.Len(t, req.Messages, 3)
+	require.Equal(t, model.RoleUser, req.Messages[2].Role)
+	require.Equal(t, instruction, req.Messages[2].Content)
+	require.True(t, calllimit.Active(inv))
+}
+
+func TestFlow_CallLLM_FinalizationIsExcludedFromSummaryFork(t *testing.T) {
+	instruction := "finish with the available context"
+	rewrittenInstruction := "rewritten finalization instruction"
+	callbackPart := "callback-added content part"
+	callbacks := model.NewCallbacks().RegisterBeforeModel(
+		func(
+			_ context.Context,
+			args *model.BeforeModelArgs,
+		) (*model.BeforeModelResult, error) {
+			require.NotNil(t, args.Request)
+			require.NotEmpty(t, args.Request.Messages)
+			tail := &args.Request.Messages[len(args.Request.Messages)-1]
+			require.Equal(t, instruction, tail.Content)
+			tail.Content = rewrittenInstruction
+			tail.ContentParts = append(
+				tail.ContentParts,
+				model.ContentPart{
+					Type: model.ContentTypeText,
+					Text: &callbackPart,
+				},
+			)
+			return nil, nil
+		},
+	)
+	response := &model.Response{
+		Done: true,
+		Choices: []model.Choice{{
+			Message: model.NewAssistantMessage("final answer"),
+		}},
+	}
+	modelStub := &mockModel{responses: []*model.Response{response}}
+	f := New(nil, nil, Options{ModelCallbacks: callbacks})
+	inv := agent.NewInvocation(agent.WithInvocationModel(modelStub))
+	inv.MaxLLMCalls = 1
+	calllimit.Configure(inv, &instruction, nil)
+	req := &model.Request{Messages: []model.Message{
+		model.NewUserMessage("real user question"),
+	}}
+
+	_, _, modelCalled, err := f.callLLM(
+		context.Background(),
+		inv,
+		req,
+		inv.Model,
+	)
+
+	require.NoError(t, err)
+	require.True(t, modelCalled)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, rewrittenInstruction, req.Messages[1].Content)
+	require.Len(t, req.Messages[1].ContentParts, 1)
+	require.Equal(t, callbackPart, *req.Messages[1].ContentParts[0].Text)
+	fork, ok := summaryfork.Request(inv)
+	require.True(t, ok)
+	require.Len(t, fork.Messages, 1)
+	require.Equal(t, "real user question", fork.Messages[0].Content)
+
+	summaryfork.AppendResponse(inv, response)
+	fork, ok = summaryfork.Request(inv)
+	require.True(t, ok)
+	require.Len(t, fork.Messages, 2)
+	require.Equal(t, "real user question", fork.Messages[0].Content)
+	require.Equal(t, "final answer", fork.Messages[1].Content)
+}
+
+func TestAppendCallLimitFinalizationMessage_PreservesSystemContentParts(
+	t *testing.T,
+) {
+	partText := "existing content part"
+	req := &model.Request{
+		Messages: []model.Message{
+			{
+				Role:    model.RoleSystem,
+				Content: "existing content",
+				ContentParts: []model.ContentPart{{
+					Type: model.ContentTypeText,
+					Text: &partText,
+				}},
+			},
+			model.NewUserMessage("question"),
+		},
+	}
+
+	appendCallLimitFinalizationMessage(req, "finalize now")
+
+	require.Len(t, req.Messages, 3)
+	require.Equal(t, model.RoleSystem, req.Messages[0].Role)
+	require.Equal(t, "existing content", req.Messages[0].Content)
+	require.Len(t, req.Messages[0].ContentParts, 1)
+	require.Equal(t, partText, *req.Messages[0].ContentParts[0].Text)
+	require.Equal(t, model.RoleUser, req.Messages[2].Role)
+	require.Equal(t, "finalize now", req.Messages[2].Content)
+}
+
+func TestRequestWithoutCallLimitFinalizationMessage_KeepsMatchingUserMessage(
+	t *testing.T,
+) {
+	instruction := "finalize now"
+	req := &model.Request{Messages: []model.Message{
+		model.NewUserMessage(instruction),
+	}}
+	marker := appendCallLimitFinalizationMessage(req, instruction)
+	require.Len(t, req.Messages, 2)
+
+	filtered := requestWithoutCallLimitFinalizationMessage(req, marker)
+	require.Len(t, filtered.Messages, 1)
+	require.Equal(t, instruction, filtered.Messages[0].Content)
+	require.Len(t, req.Messages, 2)
+
+	// If a callback removes the transient message, filtering must not remove
+	// the pre-existing user message with identical content.
+	req.Messages = req.Messages[:1]
+	filtered = requestWithoutCallLimitFinalizationMessage(req, marker)
+	require.Same(t, req, filtered)
+	require.Len(t, filtered.Messages, 1)
+}
+
+func TestRunOneStep_LLMCallLimitFinalizationEndsInvocation(t *testing.T) {
+	modelStub := &mockModel{
+		responses: []*model.Response{{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("final"),
+			}},
+		}},
+	}
+	f := newRunFlow(nil)
+	inv := runInvocationWithUserMessage(modelStub)
+	inv.MaxLLMCalls = 1
+	instruction := ""
+	calllimit.Configure(inv, &instruction, nil)
+
+	lastEvent, err := f.runOneStep(
+		context.Background(),
+		inv,
+		make(chan *event.Event, 8),
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, lastEvent)
+	require.True(t, inv.EndInvocation)
+	require.False(t, calllimit.Active(inv))
+	req := modelStub.LastRequest()
+	require.NotNil(t, req)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, model.RoleUser, req.Messages[0].Role)
+	require.Equal(t, "test", req.Messages[0].Content)
+	require.Equal(t, model.RoleUser, req.Messages[len(req.Messages)-1].Role)
+	require.Equal(t, calllimit.DefaultInstruction, req.Messages[len(req.Messages)-1].Content)
+}
+
+func TestFlow_CallLLM_LLMFinalizationPrecedesPendingToolFinalization(t *testing.T) {
+	f := New(nil, nil, Options{})
+	modelStub := &mockModel{
+		responses: []*model.Response{{
+			Done: true,
+			Choices: []model.Choice{{
+				Message: model.NewAssistantMessage("final"),
+			}},
+		}},
+	}
+	inv := agent.NewInvocation(agent.WithInvocationModel(modelStub))
+	inv.MaxLLMCalls = 1
+	llmInstruction := "finish for the LLM limit"
+	toolInstruction := "finish for the tool limit"
+	calllimit.Configure(inv, &llmInstruction, &toolInstruction)
+	require.True(t, calllimit.RecordToolIteration(inv, 1))
+	calllimit.ScheduleToolFinalization(inv)
+	req := testLLMRequest()
+
+	_, _, _, err := f.callLLM(
+		context.Background(),
+		inv,
+		req,
+		inv.Model,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, req.Messages, 2)
+	require.Equal(t, model.RoleUser, req.Messages[1].Role)
+	require.Equal(t, llmInstruction, req.Messages[1].Content)
+	require.NotEqual(t, toolInstruction, req.Messages[1].Content)
+}
+
+func TestFlow_CallLLM_ToolFinalizationDoesNotExceedLLMBudget(t *testing.T) {
+	f := New(nil, nil, Options{})
+	modelStub := &mockModel{
+		responses: []*model.Response{{Done: true}},
+	}
+	inv := agent.NewInvocation(agent.WithInvocationModel(modelStub))
+	inv.MaxLLMCalls = 1
+	toolInstruction := "finish for the tool limit"
+	calllimit.Configure(inv, nil, &toolInstruction)
+
+	_, _, _, err := f.callLLM(
+		context.Background(),
+		inv,
+		testLLMRequest(),
+		inv.Model,
+	)
+	require.NoError(t, err)
+	require.True(t, calllimit.RecordToolIteration(inv, 1))
+	calllimit.ScheduleToolFinalization(inv)
+
+	_, _, _, err = f.callLLM(
+		context.Background(),
+		inv,
+		testLLMRequest(),
+		inv.Model,
+	)
+	require.ErrorContains(t, err, "max LLM calls (1) exceeded")
+	require.False(t, calllimit.Active(inv))
 }
 
 func TestProcessStreamingResponses_ContextCancelledAfterPostprocess(t *testing.T) {
@@ -3127,8 +3907,9 @@ func TestFlow_CallLLM_PluginBeforeModelCanShortCircuit(t *testing.T) {
 		Plugins:   pm,
 	}
 
-	_, ch, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
+	_, ch, modelCalled, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
 	require.NoError(t, err)
+	require.False(t, modelCalled)
 	ch(func(_ *model.Response) bool { return true })
 	require.True(t, plugCalled)
 	require.False(t, localCalled)
@@ -3170,9 +3951,10 @@ func TestFlow_CallLLM_PluginBeforeModelError(t *testing.T) {
 		Plugins:   pm,
 	}
 
-	_, ch, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
+	_, ch, modelCalled, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
 	require.Error(t, err)
 	require.Nil(t, ch)
+	require.False(t, modelCalled)
 	require.True(t, plugCalled)
 	require.False(t, localCalled)
 	require.False(t, m.called)
@@ -3215,8 +3997,9 @@ func TestFlow_CallLLM_PluginBeforeModelContextPropagates(t *testing.T) {
 		Plugins:   pm,
 	}
 
-	_, ch, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
+	_, ch, modelCalled, err := flow.callLLM(context.Background(), inv, testLLMRequest(), inv.Model)
 	require.NoError(t, err)
+	require.False(t, modelCalled)
 	ch(func(_ *model.Response) bool { return true })
 	require.True(t, plugCalled)
 	require.Equal(t, "v", localSaw)
@@ -3382,9 +4165,35 @@ func TestFlow_callLLM_NoModel(t *testing.T) {
 	inv := agent.NewInvocation()
 	req := testLLMRequest()
 
-	_, ch, err := f.callLLM(context.Background(), inv, req, inv.Model)
+	_, ch, modelCalled, err := f.callLLM(context.Background(), inv, req, inv.Model)
 	require.Error(t, err)
 	require.Nil(t, ch)
+	require.False(t, modelCalled)
+}
+
+func TestFlow_callLLM_EmptyMessages(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation(
+		agent.WithInvocationModel(&mockModel{}),
+	)
+
+	_, ch, modelCalled, err := f.callLLM(context.Background(), inv, &model.Request{}, inv.Model)
+	require.Error(t, err)
+	require.EqualError(t, err, errMsgNoLLMMessages)
+	require.Nil(t, ch)
+	require.False(t, modelCalled)
+}
+
+func TestFlow_generateContentSeq_EmptyMessages(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation(
+		agent.WithInvocationModel(&mockModel{}),
+	)
+
+	seq, err := f.generateContentSeq(context.Background(), inv, &model.Request{}, inv.Model)
+	require.Error(t, err)
+	require.EqualError(t, err, errMsgNoLLMMessages)
+	require.Nil(t, seq)
 }
 
 func TestFlow_callLLM_EmptyMessages(t *testing.T) {
@@ -3418,9 +4227,10 @@ func TestFlow_callLLM_ModelError(t *testing.T) {
 	)
 	req := testLLMRequest()
 
-	_, ch, err := f.callLLM(context.Background(), inv, req, inv.Model)
+	_, ch, modelCalled, err := f.callLLM(context.Background(), inv, req, inv.Model)
 	require.Error(t, err)
 	require.Nil(t, ch)
+	require.True(t, modelCalled)
 }
 
 func TestFlow_RunOneStep_ModelSelectorSelectsBeforePreprocess(t *testing.T) {
@@ -3533,7 +4343,7 @@ func TestFlow_CallLLM_BeforeModelCannotReplaceCallModel(t *testing.T) {
 	)
 	f := New(nil, nil, Options{ModelCallbacks: callbacks})
 	inv := agent.NewInvocation(agent.WithInvocationModel(selectedModel))
-	_, seq, err := f.callLLM(context.Background(), inv, testLLMRequest(), selectedModel)
+	_, seq, _, err := f.callLLM(context.Background(), inv, testLLMRequest(), selectedModel)
 	require.NoError(t, err)
 	seq(func(response *model.Response) bool { return true })
 	require.True(t, selectedModel.Called())
