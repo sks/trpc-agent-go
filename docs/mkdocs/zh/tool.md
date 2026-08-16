@@ -824,6 +824,29 @@ agent := llmagent.New("mcp-assistant",
     llmagent.WithToolSets([]tool.ToolSet{mcpToolSet}))
 ```
 
+### 工具名前缀
+
+通过 `WithToolSets` 把 MCP ToolSet 挂到 `LLMAgent` 上时，框架会用
+`NamedToolSet` 包装它。模型侧看到的工具名为
+`{toolSetName}_{远端工具名}`，实际 MCP `tools/call` 仍使用远端原始名称。
+
+- 默认 ToolSet 名为 `"mcp"`，远端工具 `search` 会暴露为 `mcp_search`。
+- 挂载多个 MCP ToolSet 时，请用 `mcp.WithName(...)` 为每个 ToolSet 设置
+  不同名称。若都使用默认名，可能出现前缀冲突（例如两个 server 都有
+  `search`，模型侧都会显示为 `mcp_search`）。
+- 当 `ToolSet.Name()` 为空时不加前缀（`NewMCPToolSet` 默认不会为空）。
+
+```go
+githubToolSet := mcp.NewMCPToolSet(githubCfg, mcp.WithName("github"))
+slackToolSet := mcp.NewMCPToolSet(slackCfg, mcp.WithName("slack"))
+
+agent := llmagent.New("multi-mcp",
+    llmagent.WithModel(model),
+    llmagent.WithToolSets([]tool.ToolSet{githubToolSet, slackToolSet}),
+)
+// 模型可见名称：github_search、slack_search、...
+```
+
 ### MCP Annotations 与权限 Metadata
 
 当远端 MCP server 在 `tools/list` 中返回 tool annotations 时，直接通过
@@ -2169,7 +2192,9 @@ ch, err = r.Run(ctx, userID, sessionID, toolMsg,
 运行中改成由调用方执行，可以继续使用 `agent.WithToolExecutionFilter(...)`。
 `WithExternalTools` 更适合 AG-UI、浏览器、移动端或上游服务在每次请求中动态声明
 工具的场景。AG-UI runner 默认会把请求里的 `input.Tools` 映射为
-`WithExternalTools`。外部工具与已有工具同名时，已有工具优先，外部声明不会覆盖或拦截它。这里的已有工具包括 Agent 上注册的工具，以及通过 `WithAdditionalTools` 追加的工具。
+`WithExternalTools`；OpenAI Chat Completions adapter（`server/openai`）同样会把请求里的 `tools` 映射为 `WithExternalTools`，服务端不执行这些工具，由调用方在收到 `tool_calls` 后外部执行并用 `role=tool` 消息续聊。外部工具与已有工具同名时，已有工具优先，外部声明不会覆盖或拦截它。这里的已有工具包括 Agent 上注册的工具，以及通过 `WithAdditionalTools` 追加的工具。
+
+`server/openai` adapter 目前只实现了 `tool_choice: "none"`（不把 tools 暴露给模型）和 `tool_choice: "auto"` 或省略该字段（由模型自行决定，这也是该 adapter 能提供的唯一行为，因为它自身从不执行工具）。当请求同时带有 `tools` 时，`tool_choice: "required"` 以及强制指定函数的写法（`{"type":"function","function":{"name":"..."}}`）会被拒绝并返回 HTTP 400，而不会被静默当作 `"auto"` 处理。
 
 **完整示例：** `examples/toolinterrupt/`
 

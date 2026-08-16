@@ -846,6 +846,33 @@ agent := llmagent.New("mcp-assistant",
     llmagent.WithToolSets([]tool.ToolSet{mcpToolSet}))
 ```
 
+### Tool Name Prefixing
+
+When an MCP ToolSet is wired into an `LLMAgent` via `WithToolSets`, the
+framework wraps it with `NamedToolSet`. The model sees each remote tool under
+`{toolSetName}_{remoteToolName}` while the underlying MCP `tools/call` still
+uses the original remote name.
+
+- Default ToolSet name is `"mcp"`, so a remote tool `search` becomes
+  `mcp_search`.
+- Set a distinct name per MCP server with `mcp.WithName(...)` when you attach
+  multiple ToolSets. Reusing the default for every server can produce duplicate
+  prefixed names (for example, two servers both exposing `search` would both
+  appear as `mcp_search`).
+- If `ToolSet.Name()` is empty, no prefix is applied (not the default for
+  `NewMCPToolSet`).
+
+```go
+githubToolSet := mcp.NewMCPToolSet(githubCfg, mcp.WithName("github"))
+slackToolSet := mcp.NewMCPToolSet(slackCfg, mcp.WithName("slack"))
+
+agent := llmagent.New("multi-mcp",
+    llmagent.WithModel(model),
+    llmagent.WithToolSets([]tool.ToolSet{githubToolSet, slackToolSet}),
+)
+// Model-visible names: github_search, slack_search, ...
+```
+
 ### MCP Annotations and Permission Metadata
 
 When a remote MCP server returns tool annotations from `tools/list`, direct
@@ -2287,10 +2314,21 @@ and only its per-run execution policy should change, continue to use
 `agent.WithToolExecutionFilter(...)`. `WithExternalTools` is better for AG-UI,
 browser, mobile, or upstream-service callers that declare tools dynamically on
 each request. The AG-UI runner maps request `input.Tools` to `WithExternalTools`
-by default. If an external tool has the same name as an existing tool, the
+by default; the OpenAI Chat Completions adapter (`server/openai`) maps request
+`tools` to `WithExternalTools` as well. The server does not execute those tools;
+callers run them after receiving `tool_calls` and resume with `role=tool`
+messages. If an external tool has the same name as an existing tool, the
 existing tool wins; the external declaration does not override or intercept it.
 This includes tools registered on the Agent and tools added with
 `WithAdditionalTools`.
+
+The `server/openai` adapter only implements `tool_choice: "none"` (skip
+exposing tools to the model) and `tool_choice: "auto"` or an omitted value
+(let the model decide, which is the only behavior the adapter can offer since
+it never executes tools itself). `tool_choice: "required"` and forced-function
+tool choice (`{"type":"function","function":{"name":"..."}}`) are rejected
+with an HTTP 400 when the request also includes `tools`, instead of being
+silently treated as `"auto"`.
 
 **Complete example:** `examples/toolinterrupt/`
 
