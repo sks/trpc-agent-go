@@ -219,25 +219,25 @@ type CheckBudgetOutput struct {
 	MaskedEvents  int `json:"masked_events"`
 }
 
+// budgetFromSession returns the event counts used by check_budget and note.
+// Keeping one calculation prevents their budget snapshots from drifting.
+func budgetFromSession(sess *session.Session) CheckBudgetOutput {
+	if sess == nil {
+		return CheckBudgetOutput{}
+	}
+	return CheckBudgetOutput{
+		TotalEvents:   sess.GetEventCount(),
+		VisibleEvents: len(sess.GetVisibleEvents()),
+		MaskedEvents:  sess.MaskedEventCount(),
+	}
+}
+
 // NewCheckBudgetTool creates a tool that reports the current context budget.
 // The LLM can query this to decide when to prune context.
 func NewCheckBudgetTool() tool.CallableTool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, _ CheckBudgetInput) (CheckBudgetOutput, error) {
-			sess := sessionFromContext(ctx)
-			if sess == nil {
-				return CheckBudgetOutput{}, nil
-			}
-
-			total := sess.GetEventCount()
-			masked := sess.MaskedEventCount()
-			visible := len(sess.GetVisibleEvents())
-
-			return CheckBudgetOutput{
-				TotalEvents:   total,
-				VisibleEvents: visible,
-				MaskedEvents:  masked,
-			}, nil
+			return budgetFromSession(sessionFromContext(ctx)), nil
 		},
 		function.WithName("check_budget"),
 		function.WithDescription(
@@ -295,9 +295,20 @@ func (n *NoteInput) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// NoteOutput is the output for the note tool.
+// NoteSaveReceipt identifies the note that was persisted without repeating its
+// content in the context window.
+type NoteSaveReceipt struct {
+	Key   string `json:"key"`
+	Bytes int    `json:"bytes"`
+}
+
+// NoteOutput is the output for the note tool. Successful saves include both a
+// compact receipt and the current context budget so callers do not need an
+// immediate follow-up check_budget call.
 type NoteOutput struct {
-	Message string `json:"message"`
+	Message string             `json:"message"`
+	Saved   *NoteSaveReceipt   `json:"saved,omitempty"`
+	Budget  *CheckBudgetOutput `json:"budget,omitempty"`
 }
 
 // NewNoteTool creates a tool that writes a persistent note to session state.
@@ -331,8 +342,14 @@ func NewNoteTool() tool.CallableTool {
 
 			inv.Session.SetState(keyStr, byteContent)
 
+			budget := budgetFromSession(inv.Session)
 			return NoteOutput{
 				Message: fmt.Sprintf("note '%s' saved (%d bytes)", input.Key, len(input.Content)),
+				Saved: &NoteSaveReceipt{
+					Key:   input.Key,
+					Bytes: len(input.Content),
+				},
+				Budget: &budget,
 			}, nil
 		},
 		function.WithName("note"),
@@ -340,7 +357,9 @@ func NewNoteTool() tool.CallableTool {
 			"Save a persistent note that survives context pruning. "+
 				"Use this to distill key findings, plans, or intermediate results "+
 				"before removing raw context via delete_context. "+
-				"Notes are stored by key and can be overwritten.",
+				"Notes are stored by key and can be overwritten. The result confirms "+
+				"what was saved and includes the current context budget, so do not call "+
+				"check_budget immediately afterward.",
 		),
 	)
 }
