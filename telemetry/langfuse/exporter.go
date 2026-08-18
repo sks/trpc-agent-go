@@ -156,7 +156,8 @@ func transformInvokeAgent(span *tracepb.Span) {
 			// compared to the old behavior (Chat-only token accounting).
 		case semconvtrace.KeyGenAIUsageInputTokens, semconvtrace.KeyGenAIUsageOutputTokens,
 			semconvtrace.KeyGenAIUsageInputTokensCached, semconvtrace.KeyGenAIUsageInputTokensCacheRead,
-			semconvtrace.KeyGenAIUsageInputTokensCacheCreation:
+			semconvtrace.KeyGenAIUsageInputTokensCacheCreation, semconvtrace.KeyGenAIUsageInputTokensCacheWrite,
+			semconvtrace.KeyGenAIUsageOutputTokensReasoning, semconvtrace.KeyGenAIUsageTotalTokens:
 		default:
 			newAttributes = append(newAttributes, attr)
 		}
@@ -247,12 +248,17 @@ func collectLLMSpanAttributes(attrs []*commonpb.KeyValue) llmSpanCollected {
 		case semconvtrace.KeyGenAIUsageOutputTokens:
 			c.usage.Output = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCached:
-			c.usage.InputCached = attr.Value.GetIntValue()
-			c.usage.CachedTokens = attr.Value.GetIntValue()
+			c.usage.InputCachedTokens = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCacheRead:
 			c.usage.InputCacheRead = attr.Value.GetIntValue()
 		case semconvtrace.KeyGenAIUsageInputTokensCacheCreation:
 			c.usage.InputCacheCreation = attr.Value.GetIntValue()
+		case semconvtrace.KeyGenAIUsageInputTokensCacheWrite:
+			c.usage.CacheWriteTokens = attr.Value.GetIntValue()
+		case semconvtrace.KeyGenAIUsageOutputTokensReasoning:
+			c.usage.OutputReasoningTokens = attr.Value.GetIntValue()
+		case semconvtrace.KeyGenAIUsageTotalTokens:
+			c.usage.Total = attr.Value.GetIntValue()
 		default:
 			c.attrs = append(c.attrs, attr)
 		}

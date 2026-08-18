@@ -12,9 +12,11 @@ package openai
 
 import (
 	"context"
+	"strconv"
 
 	openai "github.com/openai/openai-go"
 	openaiopt "github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/respjson"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
 )
@@ -24,6 +26,7 @@ const (
 	defaultChannelBufferSize = 256
 	// defaultBatchCompletionWindow is the default batch completion window.
 	defaultBatchCompletionWindow = "24h"
+	cacheWriteTokensField        = "cache_write_tokens"
 )
 
 // ChatRequestCallbackFunc is the function type for the chat request callback.
@@ -414,7 +417,8 @@ func inverseOpenAISDKAddChunkUsage(u model.Usage, delta model.Usage) model.Usage
 		CompletionTokens: u.CompletionTokens - delta.CompletionTokens,
 		TotalTokens:      u.TotalTokens - delta.TotalTokens,
 		PromptTokensDetails: model.PromptTokensDetails{
-			CachedTokens: int(u.PromptTokensDetails.CachedTokens - delta.PromptTokensDetails.CachedTokens),
+			CachedTokens:     int(u.PromptTokensDetails.CachedTokens - delta.PromptTokensDetails.CachedTokens),
+			CacheWriteTokens: u.PromptTokensDetails.CacheWriteTokens - delta.PromptTokensDetails.CacheWriteTokens,
 		},
 		CompletionTokensDetails: model.CompletionTokensDetails{
 			ReasoningTokens: int(u.CompletionTokensDetails.ReasoningTokens - delta.CompletionTokensDetails.ReasoningTokens),
@@ -429,7 +433,8 @@ func completionUsageToModelUsage(usage openai.CompletionUsage) model.Usage {
 		CompletionTokens: int(usage.CompletionTokens),
 		TotalTokens:      int(usage.TotalTokens),
 		PromptTokensDetails: model.PromptTokensDetails{
-			CachedTokens: int(usage.PromptTokensDetails.CachedTokens),
+			CachedTokens:     int(usage.PromptTokensDetails.CachedTokens),
+			CacheWriteTokens: int(openAICacheWriteTokens(usage.PromptTokensDetails)),
 		},
 		CompletionTokensDetails: model.CompletionTokensDetails{
 			ReasoningTokens: int(usage.CompletionTokensDetails.ReasoningTokens),
@@ -439,7 +444,7 @@ func completionUsageToModelUsage(usage openai.CompletionUsage) model.Usage {
 
 // modelUsageToCompletionUsage converts model.Usage to openai.CompletionUsage.
 func modelUsageToCompletionUsage(usage model.Usage) openai.CompletionUsage {
-	return openai.CompletionUsage{
+	result := openai.CompletionUsage{
 		PromptTokens:     int64(usage.PromptTokens),
 		CompletionTokens: int64(usage.CompletionTokens),
 		TotalTokens:      int64(usage.TotalTokens),
@@ -450,6 +455,36 @@ func modelUsageToCompletionUsage(usage model.Usage) openai.CompletionUsage {
 			ReasoningTokens: int64(usage.CompletionTokensDetails.ReasoningTokens),
 		},
 	}
+	setOpenAICacheWriteTokens(&result.PromptTokensDetails, int64(usage.PromptTokensDetails.CacheWriteTokens))
+	return result
+}
+
+// openAICacheWriteTokens reads the forward-compatible cache-write field retained by openai-go.
+// The helper exists because v1.12.0 has no typed field for the provider value; without it,
+// cache writes disappear during conversion and downstream cost accounting undercharges them.
+func openAICacheWriteTokens(details openai.CompletionUsagePromptTokensDetails) int64 {
+	field, ok := details.JSON.ExtraFields[cacheWriteTokensField]
+	if !ok || !field.Valid() {
+		return 0
+	}
+	tokens, err := strconv.ParseInt(field.Raw(), 10, 64)
+	if err != nil || tokens < 0 {
+		return 0
+	}
+	return tokens
+}
+
+// setOpenAICacheWriteTokens stores cache-write usage in openai-go's forward-compatible JSON metadata.
+// The helper keeps round trips and streaming accumulation lossless until the pinned SDK exposes a
+// typed field; without it, the value cannot survive conversion back to the SDK response shape.
+func setOpenAICacheWriteTokens(details *openai.CompletionUsagePromptTokensDetails, tokens int64) {
+	if tokens <= 0 {
+		return
+	}
+	if details.JSON.ExtraFields == nil {
+		details.JSON.ExtraFields = make(map[string]respjson.Field)
+	}
+	details.JSON.ExtraFields[cacheWriteTokensField] = respjson.NewField(strconv.FormatInt(tokens, 10))
 }
 
 // WithTokenCounter sets the TokenCounter used for token tailoring.

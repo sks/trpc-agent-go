@@ -58,17 +58,17 @@ const (
 )
 
 // usageDetails collects token usage metrics for Langfuse's usage_details JSON field.
-// Fields follow Langfuse conventions and use omitempty to exclude zero-value fields.
-// CachedTokens mirrors InputCached under the common OpenAI/Guild name so exports
-// surface cache hits without requiring clients to know Langfuse's input_cached key.
+// Fields follow Langfuse price keys and use omitempty to exclude zero-value fields.
+// Each priced token appears in exactly one bucket so Langfuse cannot charge aliases twice.
 type usageDetails struct {
-	Input              int64 `json:"input,omitempty"`
-	Output             int64 `json:"output,omitempty"`
-	Total              int64 `json:"total,omitempty"`
-	CachedTokens       int64 `json:"cached_tokens,omitempty"`
-	InputCached        int64 `json:"input_cached,omitempty"`
-	InputCacheRead     int64 `json:"input_cache_read,omitempty"`
-	InputCacheCreation int64 `json:"input_cache_creation,omitempty"`
+	Input                 int64 `json:"input,omitempty"`
+	InputCachedTokens     int64 `json:"input_cached_tokens,omitempty"`
+	CacheWriteTokens      int64 `json:"cache_write_tokens,omitempty"`
+	InputCacheRead        int64 `json:"input_cache_read,omitempty"`
+	InputCacheCreation    int64 `json:"input_cache_creation,omitempty"`
+	Output                int64 `json:"output,omitempty"`
+	OutputReasoningTokens int64 `json:"output_reasoning_tokens,omitempty"`
+	Total                 int64 `json:"total,omitempty"`
 }
 
 // empty reports whether all fields are zero.
@@ -76,16 +76,14 @@ func (u *usageDetails) empty() bool {
 	return *u == (usageDetails{})
 }
 
-// finalize fills Total and aliases CachedTokens from InputCached before export.
+// finalize fills a missing or incomplete total from all mutually exclusive buckets.
+// Provider totals remain authoritative when they include token classes not represented here;
+// without the lower-bound check, separate cache or reasoning buckets can be omitted from totals.
 func (u *usageDetails) finalize() {
-	if u.Input > 0 || u.Output > 0 {
-		u.Total = u.Input + u.Output
-	}
-	if u.CachedTokens == 0 && u.InputCached > 0 {
-		u.CachedTokens = u.InputCached
-	}
-	if u.InputCached == 0 && u.CachedTokens > 0 {
-		u.InputCached = u.CachedTokens
+	bucketTotal := u.Input + u.InputCachedTokens + u.CacheWriteTokens +
+		u.InputCacheRead + u.InputCacheCreation + u.Output + u.OutputReasoningTokens
+	if u.Total < bucketTotal {
+		u.Total = bucketTotal
 	}
 }
 
@@ -96,16 +94,16 @@ func (u *usageDetails) finalize() {
 // separate buckets, and their adapters also populate InputCached as a cache-read
 // compatibility alias.
 func (u usageDetails) normalized() usageDetails {
+	u.Output = max(u.Output-u.OutputReasoningTokens, 0)
 	if u.InputCacheRead != 0 || u.InputCacheCreation != 0 {
 		// Prefer provider-specific buckets and drop the duplicate compatibility alias.
-		u.InputCached = 0
-		u.CachedTokens = 0
+		u.InputCachedTokens = 0
 		return u
 	}
 
 	// Langfuse flat usage details must not overlap. Keep cached input in its own
 	// bucket and convert the inclusive provider input count to the uncached remainder.
-	u.Input = max(u.Input-u.InputCached, 0)
+	u.Input = max(u.Input-u.InputCachedTokens-u.CacheWriteTokens, 0)
 	return u
 }
 
