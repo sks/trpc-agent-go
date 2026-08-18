@@ -1021,6 +1021,10 @@ func TestBuildResponseAttributes(t *testing.T) {
 						CachedTokens:        7,
 						CacheReadTokens:     11,
 						CacheCreationTokens: 13,
+						CacheWriteTokens:    17,
+					},
+					CompletionTokensDetails: model.CompletionTokensDetails{
+						ReasoningTokens: 5,
 					},
 				},
 			},
@@ -1082,6 +1086,12 @@ func TestBuildResponseAttributes(t *testing.T) {
 					}
 					if tt.rsp.Usage.PromptTokensDetails.CacheCreationTokens != 0 {
 						require.True(t, hasAttr(attrs, semconvtrace.KeyGenAIUsageInputTokensCacheCreation, int64(tt.rsp.Usage.PromptTokensDetails.CacheCreationTokens)))
+					}
+					if tt.rsp.Usage.PromptTokensDetails.CacheWriteTokens != 0 {
+						require.True(t, hasAttr(attrs, semconvtrace.KeyGenAIUsageInputTokensCacheWrite, int64(tt.rsp.Usage.PromptTokensDetails.CacheWriteTokens)))
+					}
+					if tt.rsp.Usage.CompletionTokensDetails.ReasoningTokens != 0 {
+						require.True(t, hasAttr(attrs, semconvtrace.KeyGenAIUsageOutputTokensReasoning, int64(tt.rsp.Usage.CompletionTokensDetails.ReasoningTokens)))
 					}
 				}
 			}

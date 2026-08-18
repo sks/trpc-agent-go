@@ -5965,6 +5965,9 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 			CompletionTokensDetails: model.CompletionTokensDetails{
 				ReasoningTokens: 12,
 			},
+			PromptTokensDetails: model.PromptTokensDetails{
+				CacheWriteTokens: 8,
+			},
 		}
 		delta := model.Usage{
 			PromptTokens:     10,
@@ -5972,6 +5975,9 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 			TotalTokens:      15,
 			CompletionTokensDetails: model.CompletionTokensDetails{
 				ReasoningTokens: 2,
+			},
+			PromptTokensDetails: model.PromptTokensDetails{
+				CacheWriteTokens: 3,
 			},
 		}
 
@@ -5981,6 +5987,7 @@ func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
 		assert.Equal(t, 45, result.CompletionTokens, "expected completion tokens to be 45 (50 - 5)")
 		assert.Equal(t, 135, result.TotalTokens, "expected total tokens to be 135 (150 - 15)")
 		assert.Equal(t, 10, result.CompletionTokensDetails.ReasoningTokens, "expected reasoning tokens to be 10 (12 - 2)")
+		assert.Equal(t, 5, result.PromptTokensDetails.CacheWriteTokens, "expected cache-write tokens to be 5 (8 - 3)")
 	})
 
 	t.Run("handles zero delta", func(t *testing.T) {
@@ -6030,7 +6037,8 @@ func TestModelUsageToCompletionUsage(t *testing.T) {
 			CompletionTokens: 50,
 			TotalTokens:      150,
 			PromptTokensDetails: model.PromptTokensDetails{
-				CachedTokens: 20,
+				CachedTokens:     20,
+				CacheWriteTokens: 10,
 			},
 			CompletionTokensDetails: model.CompletionTokensDetails{
 				ReasoningTokens: 15,
@@ -6043,6 +6051,7 @@ func TestModelUsageToCompletionUsage(t *testing.T) {
 		assert.Equal(t, int64(50), result.CompletionTokens, "expected completion tokens to be 50")
 		assert.Equal(t, int64(150), result.TotalTokens, "expected total tokens to be 150")
 		assert.Equal(t, int64(20), result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 20")
+		assert.Equal(t, int64(10), openAICacheWriteTokens(result.PromptTokensDetails), "expected cache-write tokens to be 10")
 		assert.Equal(t, int64(15), result.CompletionTokensDetails.ReasoningTokens, "expected reasoning tokens to be 15")
 	})
 
@@ -6074,7 +6083,8 @@ func TestModelUsageToCompletionUsage(t *testing.T) {
 			CompletionTokens: 456,
 			TotalTokens:      579,
 			PromptTokensDetails: model.PromptTokensDetails{
-				CachedTokens: 78,
+				CachedTokens:     78,
+				CacheWriteTokens: 12,
 			},
 			CompletionTokensDetails: model.CompletionTokensDetails{
 				ReasoningTokens: 90,
@@ -6089,6 +6099,7 @@ func TestModelUsageToCompletionUsage(t *testing.T) {
 		assert.Equal(t, originalUsage.CompletionTokens, backToModel.CompletionTokens, "expected completion tokens to match after roundtrip")
 		assert.Equal(t, originalUsage.TotalTokens, backToModel.TotalTokens, "expected total tokens to match after roundtrip")
 		assert.Equal(t, originalUsage.PromptTokensDetails.CachedTokens, backToModel.PromptTokensDetails.CachedTokens, "expected cached tokens to match after roundtrip")
+		assert.Equal(t, originalUsage.PromptTokensDetails.CacheWriteTokens, backToModel.PromptTokensDetails.CacheWriteTokens, "expected cache-write tokens to match after roundtrip")
 		assert.Equal(t, originalUsage.CompletionTokensDetails.ReasoningTokens, backToModel.CompletionTokensDetails.ReasoningTokens, "expected reasoning tokens to match after roundtrip")
 	})
 }
@@ -6107,6 +6118,9 @@ func TestCompletionUsageToModelUsage(t *testing.T) {
 				ReasoningTokens: int64(25),
 			},
 		}
+		openaiUsage.PromptTokensDetails.JSON.ExtraFields = map[string]respjson.Field{
+			"cache_write_tokens": respjson.NewField("11"),
+		}
 
 		result := completionUsageToModelUsage(openaiUsage)
 
@@ -6114,6 +6128,7 @@ func TestCompletionUsageToModelUsage(t *testing.T) {
 		assert.Equal(t, 75, result.CompletionTokens, "expected completion tokens to be 75")
 		assert.Equal(t, 275, result.TotalTokens, "expected total tokens to be 275")
 		assert.Equal(t, 30, result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 30")
+		assert.Equal(t, 11, result.PromptTokensDetails.CacheWriteTokens, "expected cache-write tokens to be 11")
 		assert.Equal(t, 25, result.CompletionTokensDetails.ReasoningTokens, "expected reasoning tokens to be 25")
 	})
 
@@ -6138,6 +6153,28 @@ func TestCompletionUsageToModelUsage(t *testing.T) {
 		assert.Equal(t, 0, result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 0")
 		assert.Equal(t, 0, result.CompletionTokensDetails.ReasoningTokens, "expected reasoning tokens to be 0")
 	})
+
+	t.Run("ignores malformed cache-write tokens", func(t *testing.T) {
+		openaiUsage := openai.CompletionUsage{}
+		openaiUsage.PromptTokensDetails.JSON.ExtraFields = map[string]respjson.Field{
+			"cache_write_tokens": respjson.NewField(`"invalid"`),
+		}
+
+		result := completionUsageToModelUsage(openaiUsage)
+
+		assert.Zero(t, result.PromptTokensDetails.CacheWriteTokens)
+	})
+}
+
+func TestApplyOpenAISDKTokenDetailsAccumulationFix_CacheWriteTokens(t *testing.T) {
+	acc := &openai.ChatCompletionAccumulator{}
+	setOpenAICacheWriteTokens(&acc.Usage.PromptTokensDetails, 7)
+	chunk := openai.ChatCompletionChunk{}
+	setOpenAICacheWriteTokens(&chunk.Usage.PromptTokensDetails, 5)
+
+	applyOpenAISDKTokenDetailsAccumulationFix(acc, chunk)
+
+	assert.Equal(t, int64(12), openAICacheWriteTokens(acc.Usage.PromptTokensDetails))
 }
 
 // TestWithChannelBufferSize_EdgeCases tests WithChannelBufferSize with edge cases.
