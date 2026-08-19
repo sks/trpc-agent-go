@@ -614,6 +614,9 @@ func TestTransformCallLLM_UsageDetails(t *testing.T) {
 		cachedTokens        int64
 		cacheReadTokens     int64
 		cacheCreationTokens int64
+		cacheWriteTokens    int64
+		reasoningTokens     int64
+		totalTokens         int64
 		expectedUsage       map[string]int64
 	}{
 		{
@@ -627,21 +630,34 @@ func TestTransformCallLLM_UsageDetails(t *testing.T) {
 			inputTokens:   100,
 			outputTokens:  50,
 			cachedTokens:  30,
-			expectedUsage: map[string]int64{"input": 70, "output": 50, "total": 120, "input_cached": 30, "cached_tokens": 30},
+			expectedUsage: map[string]int64{"input": 70, "output": 50, "total": 150, "input_cached_tokens": 30},
+		},
+		{
+			name:             "with cache-write and reasoning tokens",
+			inputTokens:      1000,
+			outputTokens:     150,
+			cachedTokens:     200,
+			cacheWriteTokens: 100,
+			reasoningTokens:  30,
+			totalTokens:      1150,
+			expectedUsage: map[string]int64{
+				"input": 700, "input_cached_tokens": 200, "cache_write_tokens": 100,
+				"output": 120, "output_reasoning_tokens": 30, "total": 1150,
+			},
 		},
 		{
 			name:            "with Anthropic cache_read tokens",
 			inputTokens:     200,
 			outputTokens:    80,
 			cacheReadTokens: 60,
-			expectedUsage:   map[string]int64{"input": 200, "output": 80, "total": 280, "input_cache_read": 60},
+			expectedUsage:   map[string]int64{"input": 200, "output": 80, "total": 340, "input_cache_read": 60},
 		},
 		{
 			name:                "with Anthropic cache_creation tokens",
 			inputTokens:         200,
 			outputTokens:        80,
 			cacheCreationTokens: 40,
-			expectedUsage:       map[string]int64{"input": 200, "output": 80, "total": 280, "input_cache_creation": 40},
+			expectedUsage:       map[string]int64{"input": 200, "output": 80, "total": 320, "input_cache_creation": 40},
 		},
 		{
 			name:                "all cache fields present",
@@ -650,21 +666,21 @@ func TestTransformCallLLM_UsageDetails(t *testing.T) {
 			cachedTokens:        50,
 			cacheReadTokens:     70,
 			cacheCreationTokens: 20,
-			expectedUsage:       map[string]int64{"input": 300, "output": 100, "total": 400, "input_cache_read": 70, "input_cache_creation": 20},
+			expectedUsage:       map[string]int64{"input": 300, "output": 100, "total": 490, "input_cache_read": 70, "input_cache_creation": 20},
 		},
 		{
 			name:          "cached tokens equal input",
 			inputTokens:   30,
 			outputTokens:  10,
 			cachedTokens:  30,
-			expectedUsage: map[string]int64{"output": 10, "total": 10, "input_cached": 30, "cached_tokens": 30},
+			expectedUsage: map[string]int64{"output": 10, "total": 40, "input_cached_tokens": 30},
 		},
 		{
 			name:          "cached tokens exceed input",
 			inputTokens:   20,
 			outputTokens:  10,
 			cachedTokens:  30,
-			expectedUsage: map[string]int64{"output": 10, "total": 10, "input_cached": 30, "cached_tokens": 30},
+			expectedUsage: map[string]int64{"output": 10, "total": 40, "input_cached_tokens": 30},
 		},
 		{
 			name:          "zero tokens omitted",
@@ -721,6 +737,24 @@ func TestTransformCallLLM_UsageDetails(t *testing.T) {
 					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: tt.cacheCreationTokens}},
 				})
 			}
+			if tt.cacheWriteTokens != 0 {
+				attrs = append(attrs, &commonpb.KeyValue{
+					Key:   semconvtrace.KeyGenAIUsageInputTokensCacheWrite,
+					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: tt.cacheWriteTokens}},
+				})
+			}
+			if tt.reasoningTokens != 0 {
+				attrs = append(attrs, &commonpb.KeyValue{
+					Key:   semconvtrace.KeyGenAIUsageOutputTokensReasoning,
+					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: tt.reasoningTokens}},
+				})
+			}
+			if tt.totalTokens != 0 {
+				attrs = append(attrs, &commonpb.KeyValue{
+					Key:   semconvtrace.KeyGenAIUsageTotalTokens,
+					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: tt.totalTokens}},
+				})
+			}
 
 			span := &tracepb.Span{Name: "llm-call", Attributes: attrs}
 			transformCallLLM(span)
@@ -732,6 +766,9 @@ func TestTransformCallLLM_UsageDetails(t *testing.T) {
 				assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCached, attr.Key)
 				assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheRead, attr.Key)
 				assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheCreation, attr.Key)
+				assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheWrite, attr.Key)
+				assert.NotEqual(t, semconvtrace.KeyGenAIUsageOutputTokensReasoning, attr.Key)
+				assert.NotEqual(t, semconvtrace.KeyGenAIUsageTotalTokens, attr.Key)
 			}
 
 			// Check usage_details attribute
@@ -791,6 +828,18 @@ func TestTransformInvokeAgent_CacheTokensFiltered(t *testing.T) {
 				Key:   semconvtrace.KeyGenAIUsageInputTokensCacheCreation,
 				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 10}},
 			},
+			{
+				Key:   semconvtrace.KeyGenAIUsageInputTokensCacheWrite,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 5}},
+			},
+			{
+				Key:   semconvtrace.KeyGenAIUsageOutputTokensReasoning,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 7}},
+			},
+			{
+				Key:   semconvtrace.KeyGenAIUsageTotalTokens,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 150}},
+			},
 		},
 	}
 
@@ -803,6 +852,9 @@ func TestTransformInvokeAgent_CacheTokensFiltered(t *testing.T) {
 		assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCached, attr.Key)
 		assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheRead, attr.Key)
 		assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheCreation, attr.Key)
+		assert.NotEqual(t, semconvtrace.KeyGenAIUsageInputTokensCacheWrite, attr.Key)
+		assert.NotEqual(t, semconvtrace.KeyGenAIUsageOutputTokensReasoning, attr.Key)
+		assert.NotEqual(t, semconvtrace.KeyGenAIUsageTotalTokens, attr.Key)
 	}
 }
 

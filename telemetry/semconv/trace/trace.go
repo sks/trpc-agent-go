@@ -101,6 +101,12 @@ const (
 	// KeyGenAIUsageInputTokensCacheCreation is the attribute key for tokens used to create cache (Anthropic).
 	// Note: This is an extension field; it is not part of the upstream GenAI semantic conventions yet.
 	KeyGenAIUsageInputTokensCacheCreation = "gen_ai.usage.input_tokens.cache_creation" // #nosec G101 - this is a metric key name, not a credential.
+	// KeyGenAIUsageInputTokensCacheWrite is the attribute key for provider-reported cache-write tokens.
+	// Note: This is an extension field; it is not part of the upstream GenAI semantic conventions yet.
+	KeyGenAIUsageInputTokensCacheWrite = "gen_ai.usage.input_tokens.cache_write" // #nosec G101 - this is a metric key name, not a credential.
+	// KeyGenAIUsageOutputTokensReasoning is the attribute key for reasoning output tokens.
+	// Note: This is an extension field; it is not part of the upstream GenAI semantic conventions yet.
+	KeyGenAIUsageOutputTokensReasoning = "gen_ai.usage.output_tokens.reasoning" // #nosec G101 - this is a metric key name, not a credential.
 	// KeyGenAIProviderName is the attribute key for provider name.
 	KeyGenAIProviderName = "gen_ai.provider.name"
 	// KeyGenAIAgentDescription is the attribute key for agent description.

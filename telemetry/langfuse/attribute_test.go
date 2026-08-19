@@ -121,26 +121,43 @@ func TestUsageDetailsNormalized(t *testing.T) {
 		},
 		{
 			name:  "inclusive cached input",
-			usage: usageDetails{Input: 100, Output: 50, InputCached: 30},
-			want:  usageDetails{Input: 70, Output: 50, InputCached: 30},
+			usage: usageDetails{Input: 100, Output: 50, InputCachedTokens: 30},
+			want:  usageDetails{Input: 70, Output: 50, InputCachedTokens: 30},
+		},
+		{
+			name: "inclusive cache write and reasoning output",
+			usage: usageDetails{
+				Input:                 100,
+				InputCachedTokens:     20,
+				CacheWriteTokens:      10,
+				Output:                50,
+				OutputReasoningTokens: 15,
+			},
+			want: usageDetails{
+				Input:                 70,
+				InputCachedTokens:     20,
+				CacheWriteTokens:      10,
+				Output:                35,
+				OutputReasoningTokens: 15,
+			},
 		},
 		{
 			name:  "all input cached",
-			usage: usageDetails{Input: 30, Output: 10, InputCached: 30},
-			want:  usageDetails{Output: 10, InputCached: 30},
+			usage: usageDetails{Input: 30, Output: 10, InputCachedTokens: 30},
+			want:  usageDetails{Output: 10, InputCachedTokens: 30},
 		},
 		{
 			name:  "cached input exceeds input",
-			usage: usageDetails{Input: 20, Output: 10, InputCached: 30},
-			want:  usageDetails{Output: 10, InputCached: 30},
+			usage: usageDetails{Input: 20, Output: 10, InputCachedTokens: 30},
+			want:  usageDetails{Output: 10, InputCachedTokens: 30},
 		},
 		{
 			name: "provider cache read replaces compatibility alias",
 			usage: usageDetails{
-				Input:          20,
-				Output:         10,
-				InputCached:    80,
-				InputCacheRead: 80,
+				Input:             20,
+				Output:            10,
+				InputCachedTokens: 80,
+				InputCacheRead:    80,
 			},
 			want: usageDetails{
 				Input:          20,
@@ -166,7 +183,7 @@ func TestUsageDetailsNormalized(t *testing.T) {
 			usage: usageDetails{
 				Input:              20,
 				Output:             10,
-				InputCached:        70,
+				InputCachedTokens:  70,
 				InputCacheRead:     70,
 				InputCacheCreation: 10,
 			},

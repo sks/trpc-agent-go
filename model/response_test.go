@@ -138,7 +138,8 @@ func TestPromptTokensDetails_Structure(t *testing.T) {
 		{
 			name: "OpenAI style - cached tokens only",
 			details: PromptTokensDetails{
-				CachedTokens: 100,
+				CachedTokens:     100,
+				CacheWriteTokens: 25,
 			},
 		},
 		{
@@ -162,6 +163,7 @@ func TestPromptTokensDetails_Structure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.GreaterOrEqual(t, tt.details.CachedTokens, 0)
+			assert.GreaterOrEqual(t, tt.details.CacheWriteTokens, 0)
 			assert.GreaterOrEqual(t, tt.details.CacheCreationTokens, 0)
 			assert.GreaterOrEqual(t, tt.details.CacheReadTokens, 0)
 		})

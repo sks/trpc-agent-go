@@ -724,6 +724,12 @@ func buildResponseAttributes(rsp *model.Response, errorTypeFallback string) []at
 			// Anthropic: cache_creation_tokens
 			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageInputTokensCacheCreation, cacheCreation))
 		}
+		if cacheWrite := rsp.Usage.PromptTokensDetails.CacheWriteTokens; cacheWrite != 0 {
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageInputTokensCacheWrite, cacheWrite))
+		}
+		if reasoning := rsp.Usage.CompletionTokensDetails.ReasoningTokens; reasoning != 0 {
+			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageOutputTokensReasoning, reasoning))
+		}
 	}
 
 	// Add choices attributes
