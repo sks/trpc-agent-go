@@ -638,6 +638,7 @@ func appendTimeProcessor(options *Options, requestProcessors []flow.RequestProce
 		processor.WithAddCurrentTime(true),
 		processor.WithTimezone(options.Timezone),
 		processor.WithTimeFormat(options.TimeFormat),
+		processor.WithTimePromptPlacement(options.TimePromptPlacement),
 		processor.WithCurrentTimeTool(
 			toolcurrenttime.ToolName,
 			options.OutputSchema == nil,
