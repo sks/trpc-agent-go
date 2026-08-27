@@ -3054,6 +3054,13 @@ func (r *runner) emitRunnerCompletion(ctx context.Context, loop *eventLoopContex
 		runnerCompletionEvent.Response.Error = cloneResponseError(
 			loop.finalError,
 		)
+	} else if loop.finalError == nil &&
+		ctx.Err() != nil &&
+		runnerCompletionEvent.Response != nil {
+		runnerCompletionEvent.Response.Error = &model.ResponseError{
+			Type:    model.ErrorTypeCancelled,
+			Message: contextDoneReason(ctx),
+		}
 	}
 
 	agent.InjectIntoEvent(loop.invocation, runnerCompletionEvent)
