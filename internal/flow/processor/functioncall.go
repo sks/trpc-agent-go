@@ -71,9 +71,10 @@ const (
 // tool.response event has been processed by the session persistence layer.
 const funcRespCompletionTimeout = 5 * time.Second
 
-// funcRespDeadlinePersistenceTimeout bounds the fallback append used when a
-// completed tool response cannot enter the runner event loop after deadline.
-const funcRespDeadlinePersistenceTimeout = time.Second
+// funcRespInterruptionPersistenceTimeout bounds the fallback append used when
+// a completed tool response cannot enter the runner event loop after its
+// context is canceled or reaches its deadline.
+const funcRespInterruptionPersistenceTimeout = time.Second
 
 const (
 	knowledgeSearchToolName                    = "knowledge_search"
@@ -531,15 +532,16 @@ func emitFunctionResponseEventAndWait(
 		eventChan,
 		functionResponseEvent,
 	)
-	if errors.Is(emitErr, context.DeadlineExceeded) {
-		if persistErr := persistFunctionResponseAfterDeadline(
+	if errors.Is(emitErr, context.Canceled) ||
+		errors.Is(emitErr, context.DeadlineExceeded) {
+		if persistErr := persistFunctionResponseAfterInterruption(
 			ctx,
 			invocation,
 			functionResponseEvent,
 		); persistErr != nil {
 			log.WarnfContext(
 				ctx,
-				"Persist tool response after deadline failed: %v",
+				"Persist tool response after interruption failed: %v",
 				persistErr,
 			)
 		}
@@ -666,7 +668,7 @@ func (p *FunctionCallResponseProcessor) handleFunctionCallsAndSendPerCallResultE
 	toolresultround.Mark(errorEvent, true)
 	emitErr := agent.EmitEvent(ctx, invocation, eventChan, errorEvent)
 	if emitErr != nil {
-		if persistErr := persistFunctionResponseAfterDeadline(
+		if persistErr := persistFunctionResponseAfterInterruption(
 			ctx,
 			invocation,
 			errorEvent,
@@ -681,7 +683,7 @@ func (p *FunctionCallResponseProcessor) handleFunctionCallsAndSendPerCallResultE
 	return nil, err
 }
 
-func persistFunctionResponseAfterDeadline(
+func persistFunctionResponseAfterInterruption(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	functionResponseEvent *event.Event,
@@ -691,7 +693,7 @@ func persistFunctionResponseAfterDeadline(
 	}
 	persistCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx),
-		funcRespDeadlinePersistenceTimeout,
+		funcRespInterruptionPersistenceTimeout,
 	)
 	defer cancel()
 	routeEvent := sessionroute.SnapshotEventIdentity(functionResponseEvent)
@@ -704,7 +706,7 @@ func persistFunctionResponseAfterDeadline(
 		metadata := *functionResponseEvent.ParentMetadata
 		parentMetadata = &metadata
 	}
-	functionResponseEvent = applyEventPluginsAfterDeadline(
+	functionResponseEvent = applyEventPluginsAfterInterruption(
 		persistCtx,
 		invocation,
 		functionResponseEvent,
@@ -730,7 +732,7 @@ func persistFunctionResponseAfterDeadline(
 		return nil
 	}
 	if invocation == nil || invocation.SessionService == nil {
-		return errors.New("session service unavailable after deadline")
+		return errors.New("session service unavailable after interruption")
 	}
 	persistSession, routed := sessionroute.RouteEvent(
 		invocation,
@@ -740,7 +742,7 @@ func persistFunctionResponseAfterDeadline(
 		persistSession = invocation.Session
 	}
 	if persistSession == nil {
-		return errors.New("session unavailable after deadline")
+		return errors.New("session unavailable after interruption")
 	}
 	return invocation.SessionService.AppendEvent(
 		persistCtx,
@@ -749,7 +751,7 @@ func persistFunctionResponseAfterDeadline(
 	)
 }
 
-func applyEventPluginsAfterDeadline(
+func applyEventPluginsAfterInterruption(
 	ctx context.Context,
 	invocation *agent.Invocation,
 	evt *event.Event,

@@ -7571,6 +7571,10 @@ func TestRunner_CancelEmitsRunnerCompletion(t *testing.T) {
 	}
 
 	require.Equal(t, 1, completionCount, "should receive exactly one runner-completion after cancel")
+	require.NotNil(t, completion.Response)
+	require.NotNil(t, completion.Response.Error)
+	require.Equal(t, model.ErrorTypeCancelled, completion.Response.Error.Type)
+	require.Equal(t, context.Canceled.Error(), completion.Response.Error.Message)
 	require.NotNil(t, completion.ExecutionTrace)
 	require.Equal(t, atrace.TraceStatusIncomplete, completion.ExecutionTrace.Status)
 }

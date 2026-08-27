@@ -5015,7 +5015,7 @@ func TestFunctionCallResponseProcessor_HandleFunctionCallsAndSendEvent_Canceled(
 	assert.Zero(t, appendCalls.Load())
 }
 
-func TestFunctionCallResponseProcessor_CanceledBeforeToolResponseEmit(
+func TestFunctionCallResponseProcessor_PersistsToolResponseAfterCancellation(
 	t *testing.T,
 ) {
 	const (
@@ -5031,9 +5031,12 @@ func TestFunctionCallResponseProcessor_CanceledBeforeToolResponseEmit(
 		agent.WithInvocationAgent(&mockAgentWithTools{name: "test-agent"}),
 		agent.WithInvocationModel(&mockModel{}),
 	)
+	appended := make(chan *event.Event, 1)
 	var appendCalls atomic.Int32
-	appender.Attach(inv, func(context.Context, *event.Event) error {
+	appender.Attach(inv, func(appendCtx context.Context, evt *event.Event) error {
 		appendCalls.Add(1)
+		require.NoError(t, appendCtx.Err())
+		appended <- evt
 		return nil
 	})
 	tools := map[string]tool.Tool{
@@ -5074,7 +5077,16 @@ func TestFunctionCallResponseProcessor_CanceledBeforeToolResponseEmit(
 	)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Nil(t, got)
-	assert.Zero(t, appendCalls.Load())
+	select {
+	case evt := <-appended:
+		require.NotNil(t, evt)
+		require.True(t, evt.RequiresCompletion)
+		require.True(t, evt.IsToolResultResponse())
+		require.JSONEq(t, `"late evidence"`, evt.Response.Choices[0].Message.Content)
+	default:
+		t.Fatal("tool.response event was not persisted after cancellation")
+	}
+	require.Equal(t, int32(1), appendCalls.Load())
 	select {
 	case <-eventChan:
 		t.Fatalf("unexpected tool.response event after cancellation")
@@ -5115,7 +5127,7 @@ func TestFunctionCallResponseProcessor_PersistsToolResponseAfterDeadline(
 		require.LessOrEqual(
 			t,
 			time.Until(deadline),
-			funcRespDeadlinePersistenceTimeout,
+			funcRespInterruptionPersistenceTimeout,
 		)
 		appended <- evt
 		return nil
@@ -5193,7 +5205,7 @@ func TestFunctionCallResponseProcessor_PersistsToolResponseAfterDeadline(
 	}
 }
 
-func TestPersistFunctionResponseAfterDeadline_UsesRoutedSessionService(
+func TestPersistFunctionResponseAfterInterruption_UsesRoutedSessionService(
 	t *testing.T,
 ) {
 	ctx, cancel := context.WithDeadline(
@@ -5298,7 +5310,7 @@ func TestPersistFunctionResponseAfterDeadline_UsesRoutedSessionService(
 	require.False(t, evt.IsPartial)
 	require.False(t, appender.IsAttached(inv))
 
-	err = persistFunctionResponseAfterDeadline(ctx, inv, evt)
+	err = persistFunctionResponseAfterInterruption(ctx, inv, evt)
 	require.NoError(t, err)
 	require.Equal(t, 1, pluginCalls)
 	require.Equal(t, int32(1), recordingService.appendCalls.Load())
@@ -5327,7 +5339,7 @@ func TestPersistFunctionResponseAfterDeadline_UsesRoutedSessionService(
 	require.Equal(t, evt.Branch, persisted.Events[1].Branch)
 }
 
-func TestPersistFunctionResponseAfterDeadline_FallbacksAndErrors(
+func TestPersistFunctionResponseAfterInterruption_FallbacksAndErrors(
 	t *testing.T,
 ) {
 	ctx, cancel := context.WithDeadline(
@@ -5336,7 +5348,7 @@ func TestPersistFunctionResponseAfterDeadline_FallbacksAndErrors(
 	)
 	defer cancel()
 	t.Run("nil event", func(t *testing.T) {
-		require.NoError(t, persistFunctionResponseAfterDeadline(
+		require.NoError(t, persistFunctionResponseAfterInterruption(
 			ctx,
 			nil,
 			nil,
@@ -5362,18 +5374,18 @@ func TestPersistFunctionResponseAfterDeadline_FallbacksAndErrors(
 			return wantErr
 		})
 
-		err := persistFunctionResponseAfterDeadline(ctx, inv, evt)
+		err := persistFunctionResponseAfterInterruption(ctx, inv, evt)
 		require.ErrorIs(t, err, wantErr)
 	})
 
 	t.Run("session service unavailable", func(t *testing.T) {
 		inv := agent.NewInvocation()
 
-		err := persistFunctionResponseAfterDeadline(ctx, inv, evt)
+		err := persistFunctionResponseAfterInterruption(ctx, inv, evt)
 		require.EqualError(
 			t,
 			err,
-			"session service unavailable after deadline",
+			"session service unavailable after interruption",
 		)
 	})
 
@@ -5388,8 +5400,8 @@ func TestPersistFunctionResponseAfterDeadline_FallbacksAndErrors(
 			agent.WithInvocationSessionService(recordingService),
 		)
 
-		err := persistFunctionResponseAfterDeadline(ctx, inv, evt)
-		require.EqualError(t, err, "session unavailable after deadline")
+		err := persistFunctionResponseAfterInterruption(ctx, inv, evt)
+		require.EqualError(t, err, "session unavailable after interruption")
 	})
 
 	t.Run("root session fallback", func(t *testing.T) {
@@ -5409,14 +5421,14 @@ func TestPersistFunctionResponseAfterDeadline_FallbacksAndErrors(
 		)
 		agent.InjectIntoEvent(inv, evt)
 
-		err = persistFunctionResponseAfterDeadline(ctx, inv, evt)
+		err = persistFunctionResponseAfterInterruption(ctx, inv, evt)
 		require.NoError(t, err)
 		require.Equal(t, int32(1), recordingService.appendCalls.Load())
 		require.Same(t, rootSess, recordingService.appendSession.Load())
 	})
 }
 
-func TestPersistFunctionResponseAfterDeadline_AppliesEventPlugins(
+func TestPersistFunctionResponseAfterInterruption_AppliesEventPlugins(
 	t *testing.T,
 ) {
 	ctx, cancel := context.WithDeadline(
@@ -5493,7 +5505,7 @@ func TestPersistFunctionResponseAfterDeadline_AppliesEventPlugins(
 	}
 	toolresultround.Mark(original, true)
 
-	err := persistFunctionResponseAfterDeadline(ctx, inv, original)
+	err := persistFunctionResponseAfterInterruption(ctx, inv, original)
 
 	require.NoError(t, err)
 	require.Equal(t, 1, pluginCalls)
@@ -5513,7 +5525,7 @@ func TestPersistFunctionResponseAfterDeadline_AppliesEventPlugins(
 	require.True(t, toolresultround.IsIncomplete(persisted))
 }
 
-func TestPersistFunctionResponseAfterDeadline_PluginErrorPersistsOriginal(
+func TestPersistFunctionResponseAfterInterruption_PluginErrorPersistsOriginal(
 	t *testing.T,
 ) {
 	ctx, cancel := context.WithDeadline(
@@ -5589,7 +5601,7 @@ func TestPersistFunctionResponseAfterDeadline_PluginErrorPersistsOriginal(
 				}}},
 			)
 
-			err := persistFunctionResponseAfterDeadline(ctx, inv, evt)
+			err := persistFunctionResponseAfterInterruption(ctx, inv, evt)
 
 			require.NoError(t, err)
 			if tc.attachAppender {
