@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 	"trpc.group/trpc-go/trpc-agent-go/internal/toolorder"
@@ -90,6 +91,14 @@ func (m *Model) buildParams(request *model.Request) (responses.ResponseNewParams
 			OfInputItemList: items,
 		},
 	}
+	// Stateless mode cannot look up prior rs_* ids. Request encrypted
+	// reasoning so clients can replay CoT across tool hops (OpenAI ZDR /
+	// store=false contract; openai-agents-python + Vercel AI SDK do the same).
+	if !m.store {
+		params.Include = []responses.ResponseIncludable{
+			responses.ResponseIncludableReasoningEncryptedContent,
+		}
+	}
 	if request.MaxTokens != nil {
 		params.MaxOutputTokens = openai.Int(int64(*request.MaxTokens))
 	}
@@ -156,12 +165,13 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, er
 				text,
 			))
 		case model.RoleAssistant:
-			// Omit plaintext ReasoningContent from Responses input. Fabricated
-			// ids like rs_replay_N fail when store=false (OpenAI: "Item with id
-			// not found. Items are not persisted when store is set to false").
-			// Replay only becomes valid once stream capture stores
-			// reasoning.encrypted_content (follow-up); until then skip the item
-			// and keep function_call / message items so tool loops still work.
+			// Replay encrypted reasoning before tool calls when present. Never
+			// invent rs_* ids from plaintext ReasoningContent alone — that 404s
+			// under store=false. OpenAI accepts encrypted_content without a
+			// server-persisted id (Vercel omits id on the store=false path).
+			if item, ok := reasoningInputItem(msg); ok {
+				items = append(items, item)
+			}
 			for _, tc := range msg.ToolCalls {
 				callID := tc.ID
 				if callID == "" {
@@ -189,6 +199,25 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, er
 		}
 	}
 	return items, nil
+}
+
+// reasoningInputItem builds a Responses reasoning input item from a stored
+// ReasoningSignature (encrypted_content). Plaintext ReasoningContent alone is
+// not enough for store=false replay.
+func reasoningInputItem(msg model.Message) (responses.ResponseInputItemUnionParam, bool) {
+	enc := strings.TrimSpace(msg.ReasoningSignature)
+	if enc == "" {
+		return responses.ResponseInputItemUnionParam{}, false
+	}
+	reasoning := &responses.ResponseReasoningItemParam{
+		EncryptedContent: param.NewOpt(enc),
+	}
+	if summary := strings.TrimSpace(msg.ReasoningContent); summary != "" {
+		reasoning.Summary = []responses.ResponseReasoningItemSummaryParam{{
+			Text: summary,
+		}}
+	}
+	return responses.ResponseInputItemUnionParam{OfReasoning: reasoning}, true
 }
 
 func roleToEasyInput(role model.Role) responses.EasyInputMessageRole {
@@ -437,10 +466,11 @@ func projectResponse(id, modelName string, created int64, resp *responses.Respon
 		Choices: []model.Choice{{
 			Index: 0,
 			Message: model.Message{
-				Role:             model.RoleAssistant,
-				Content:          projected.text,
-				ReasoningContent: projected.reasoning,
-				ToolCalls:        projected.toolCalls,
+				Role:               model.RoleAssistant,
+				Content:            projected.text,
+				ReasoningContent:   projected.reasoning,
+				ReasoningSignature: projected.encrypted,
+				ToolCalls:          projected.toolCalls,
 			},
 			Delta: model.Message{
 				Role:             model.RoleAssistant,
@@ -460,6 +490,7 @@ func projectResponse(id, modelName string, created int64, resp *responses.Respon
 type projectedOutput struct {
 	text      string
 	reasoning string
+	encrypted string
 	toolCalls []model.ToolCall
 }
 
@@ -516,6 +547,11 @@ func projectOutput(resp *responses.Response) projectedOutput {
 				for _, part := range rs.Content {
 					reasoning.WriteString(part.Text)
 				}
+			}
+			// Prefer the final completed item's encrypted blob (pi-mono
+			// backfills from response.completed for the same reason).
+			if enc := strings.TrimSpace(rs.EncryptedContent); enc != "" {
+				out.encrypted = enc
 			}
 		}
 	}
