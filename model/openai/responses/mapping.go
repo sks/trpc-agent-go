@@ -205,20 +205,22 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, er
 // ReasoningSignature (encrypted_content). Plaintext ReasoningContent alone is
 // not enough for store=false replay. gpt-5 still requires summary on the
 // reasoning item even when encrypted_content is present, so always emit it
-// (empty string when no plaintext summary was captured).
+// (empty string when no plaintext summary was captured). The openai-go SDK
+// marks reasoning.id as required and marshals "" when unset; OpenAI rejects
+// empty id, so force-omit it (Vercel / store=false path also omits id).
 func reasoningInputItem(msg model.Message) (responses.ResponseInputItemUnionParam, bool) {
 	enc := strings.TrimSpace(msg.ReasoningSignature)
 	if enc == "" {
 		return responses.ResponseInputItemUnionParam{}, false
 	}
-	return responses.ResponseInputItemUnionParam{
-		OfReasoning: &responses.ResponseReasoningItemParam{
-			EncryptedContent: param.NewOpt(enc),
-			Summary: []responses.ResponseReasoningItemSummaryParam{{
-				Text: strings.TrimSpace(msg.ReasoningContent),
-			}},
-		},
-	}, true
+	reasoning := &responses.ResponseReasoningItemParam{
+		EncryptedContent: param.NewOpt(enc),
+		Summary: []responses.ResponseReasoningItemSummaryParam{{
+			Text: strings.TrimSpace(msg.ReasoningContent),
+		}},
+	}
+	reasoning.SetExtraFields(map[string]any{"id": param.Omit})
+	return responses.ResponseInputItemUnionParam{OfReasoning: reasoning}, true
 }
 
 func roleToEasyInput(role model.Role) responses.EasyInputMessageRole {

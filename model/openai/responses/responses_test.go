@@ -330,10 +330,8 @@ func TestConvertMessages_ReplaysEncryptedReasoning(t *testing.T) {
 	require.Equal(t, "reasoning", decoded[1]["type"])
 	require.Equal(t, "enc_blob_abc", decoded[1]["encrypted_content"])
 	require.Equal(t, "need a tool", decoded[1]["summary"].([]any)[0].(map[string]any)["text"])
-	if id, ok := decoded[1]["id"].(string); ok {
-		require.Empty(t, id, "store=false replay must not send a server reasoning id")
-		require.False(t, strings.HasPrefix(id, "rs_"))
-	}
+	_, hasID := decoded[1]["id"]
+	require.False(t, hasID, "store=false replay must omit reasoning id (empty id is rejected)")
 	require.Equal(t, "function_call", decoded[2]["type"])
 	require.Equal(t, "function_call_output", decoded[3]["type"])
 }
@@ -367,6 +365,8 @@ func TestConvertMessages_ReplaysEncryptedReasoningWithEmptySummary(t *testing.T)
 	require.True(t, ok, "summary must be present for gpt-5")
 	require.NotEmpty(t, summary)
 	require.Equal(t, "", summary[0].(map[string]any)["text"])
+	_, hasID := decoded[1]["id"]
+	require.False(t, hasID, "empty reasoning id must be omitted, not sent as \"\"")
 }
 
 func TestConvertMessages_OmitsPlaintextReasoningOnly(t *testing.T) {
