@@ -263,6 +263,9 @@ func TestGenerateContent_IncompleteMapsToLength(t *testing.T) {
 }
 
 func TestConvertMessages_ToolCallAndReasoningReplay(t *testing.T) {
+	// Plaintext ReasoningContent must not become a reasoning input item
+	// (fabricated rs_replay_* ids fail with store=false). Tool call + output
+	// items still convert so multi-step loops work.
 	items, err := convertMessages([]model.Message{
 		model.NewUserMessage("calc"),
 		{
@@ -285,13 +288,37 @@ func TestConvertMessages_ToolCallAndReasoningReplay(t *testing.T) {
 	var decoded []map[string]any
 	require.NoError(t, json.Unmarshal(raw, &decoded))
 	require.Equal(t, "user", decoded[0]["role"])
-	require.Equal(t, "reasoning", decoded[1]["type"])
-	require.Equal(t, "function_call", decoded[2]["type"])
-	require.Equal(t, "function_call_output", decoded[3]["type"])
-	require.Equal(t, "need a tool", decoded[1]["summary"].([]any)[0].(map[string]any)["text"])
+	require.Equal(t, "function_call", decoded[1]["type"])
+	require.Equal(t, "function_call_output", decoded[2]["type"])
+	require.Equal(t, "call_1", decoded[1]["call_id"])
 	require.Equal(t, "call_1", decoded[2]["call_id"])
-	require.Equal(t, "call_1", decoded[3]["call_id"])
-	require.Equal(t, "2", decoded[3]["output"])
+	require.Equal(t, "2", decoded[2]["output"])
+	for _, item := range decoded {
+		require.NotEqual(t, "reasoning", item["type"])
+		id, _ := item["id"].(string)
+		require.False(t, strings.HasPrefix(id, "rs_replay_"), "unexpected fabricated id %q", id)
+	}
+}
+
+func TestConvertMessages_OmitsPlaintextReasoningOnly(t *testing.T) {
+	items, err := convertMessages([]model.Message{
+		model.NewUserMessage("hi"),
+		{
+			Role:             model.RoleAssistant,
+			ReasoningContent: "thinking only",
+			Content:          "hello",
+		},
+	})
+	require.NoError(t, err)
+	raw, err := json.Marshal(items)
+	require.NoError(t, err)
+	var decoded []map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	require.Equal(t, "user", decoded[0]["role"])
+	require.Equal(t, "assistant", decoded[1]["role"])
+	for _, item := range decoded {
+		require.NotEqual(t, "reasoning", item["type"])
+	}
 }
 
 func TestGenerateContent_ExtraFieldsAndOfficialEffort(t *testing.T) {

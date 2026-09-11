@@ -144,7 +144,6 @@ func applyToolChoice(params *responses.ResponseNewParams, extra map[string]any) 
 
 func convertMessages(messages []model.Message) (responses.ResponseInputParam, error) {
 	items := make(responses.ResponseInputParam, 0, len(messages)*2)
-	reasoningIndex := 0
 	for _, msg := range messages {
 		switch msg.Role {
 		case model.RoleTool:
@@ -157,15 +156,12 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, er
 				text,
 			))
 		case model.RoleAssistant:
-			if strings.TrimSpace(msg.ReasoningContent) != "" {
-				items = append(items, responses.ResponseInputItemParamOfReasoning(
-					fmt.Sprintf("rs_replay_%d", reasoningIndex),
-					[]responses.ResponseReasoningItemSummaryParam{{
-						Text: msg.ReasoningContent,
-					}},
-				))
-				reasoningIndex++
-			}
+			// Omit plaintext ReasoningContent from Responses input. Fabricated
+			// ids like rs_replay_N fail when store=false (OpenAI: "Item with id
+			// not found. Items are not persisted when store is set to false").
+			// Replay only becomes valid once stream capture stores
+			// reasoning.encrypted_content (follow-up); until then skip the item
+			// and keep function_call / message items so tool loops still work.
 			for _, tc := range msg.ToolCalls {
 				callID := tc.ID
 				if callID == "" {
