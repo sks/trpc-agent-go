@@ -160,10 +160,9 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, er
 			if err != nil {
 				return nil, err
 			}
-			items = append(items, responses.ResponseInputItemParamOfFunctionCallOutput(
-				msg.ToolID,
-				text,
-			))
+			item := responses.ResponseInputItemParamOfFunctionCallOutput(text)
+			item.OfFunctionCallOutput.CallID = param.NewOpt(msg.ToolID)
+			items = append(items, item)
 		case model.RoleAssistant:
 			// Replay encrypted reasoning before tool calls when present. Never
 			// invent rs_* ids from plaintext ReasoningContent alone — that 404s

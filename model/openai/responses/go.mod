@@ -5,7 +5,7 @@ go 1.25.0
 replace trpc.group/trpc-go/trpc-agent-go => ../../..
 
 require (
-	github.com/openai/openai-go/v3 v3.50.0
+	github.com/openai/openai-go/v3 v3.61.0
 	github.com/stretchr/testify v1.11.1
 	trpc.group/trpc-go/trpc-agent-go v1.11.1
 )
