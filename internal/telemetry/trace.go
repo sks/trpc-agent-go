@@ -730,6 +730,16 @@ func buildResponseAttributes(rsp *model.Response, errorTypeFallback string) []at
 		if reasoning := rsp.Usage.CompletionTokensDetails.ReasoningTokens; reasoning != 0 {
 			attrs = append(attrs, attribute.Int(semconvtrace.KeyGenAIUsageOutputTokensReasoning, reasoning))
 		}
+		// Host-supplied cost rides on the same generation span as usage so Langfuse
+		// stores dollars without needing its ingest catalog. Empty CostDetails skips
+		// the attribute; Langfuse may still price from usage alone when configured.
+		if len(rsp.Usage.CostDetails) > 0 {
+			if costJSON, err := json.Marshal(rsp.Usage.CostDetails); err == nil {
+				attrs = append(attrs, attribute.String(
+					"langfuse.observation.cost_details", string(costJSON),
+				))
+			}
+		}
 	}
 
 	// Add choices attributes
