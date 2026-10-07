@@ -575,6 +575,12 @@ func TestListContextTool(t *testing.T) {
 		if out.Count != 1 || len(out.Events) != 1 {
 			t.Fatalf("expected 1 visible event, got %+v", out)
 		}
+		if out.TotalCount != 1 || out.OmittedCount != 0 {
+			t.Fatalf("unexpected totals: %+v", out)
+		}
+		if out.Order != ListContextOrderBytesDesc {
+			t.Fatalf("expected default bytes_desc order, got %q", out.Order)
+		}
 		if out.Events[0].ID != "e2" {
 			t.Fatalf("expected e2, got %+v", out.Events[0])
 		}
@@ -674,5 +680,434 @@ func TestToolsReturnsAllContextTools(t *testing.T) {
 		if !names[name] {
 			t.Fatalf("missing tool: %s", name)
 		}
+	}
+}
+
+type staticBudgetReporter struct {
+	report BudgetReport
+	ok     bool
+}
+
+func (r staticBudgetReporter) ReportBudget(context.Context) (BudgetReport, bool) {
+	return r.report, r.ok
+}
+
+func TestCheckBudgetToolWithReporter(t *testing.T) {
+	t.Run("without reporter returns event counts only", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "budget-fallback")
+		sess.Events = []event.Event{newTestEvent("e1"), newTestEvent("e2")}
+		sess.MaskEvents("e2")
+		ctx := ctxWithSession(sess)
+
+		result, err := NewCheckBudgetTool().Call(ctx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(CheckBudgetOutput)
+		if out.TotalEvents != 2 || out.VisibleEvents != 1 || out.MaskedEvents != 1 {
+			t.Fatalf("unexpected event counts: %+v", out)
+		}
+		if out.EstimatedTokens != nil || out.UsedPct != nil {
+			t.Fatalf("token fields must be absent without reporter: %+v", out)
+		}
+	})
+
+	t.Run("propagates reporter snapshot with used_pct when cap known", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "budget-known")
+		sess.Events = []event.Event{newTestEvent("e1")}
+		ctx := ctxWithSession(sess)
+		reporter := staticBudgetReporter{
+			ok: true,
+			report: BudgetReport{
+				EstimatedTokens:     1000,
+				UpperBoundTokens:    1662,
+				MaxInputTokens:      922000,
+				OutputReserveTokens: 16384,
+				HeadroomTokens:      920338,
+				ContextWindowTokens: 1048576,
+				CapKnown:            true,
+			},
+		}
+
+		result, err := NewCheckBudgetTool(WithBudgetReporter(reporter)).Call(ctx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(CheckBudgetOutput)
+		if out.EstimatedTokens == nil || *out.EstimatedTokens != 1000 {
+			t.Fatalf("unexpected estimated_tokens: %+v", out.EstimatedTokens)
+		}
+		if out.UpperBoundTokens == nil || *out.UpperBoundTokens != 1662 {
+			t.Fatalf("unexpected upper_bound_tokens: %+v", out.UpperBoundTokens)
+		}
+		if out.MaxInputTokens == nil || *out.MaxInputTokens != 922000 {
+			t.Fatalf("unexpected max_input_tokens: %+v", out.MaxInputTokens)
+		}
+		if out.UsedPct == nil {
+			t.Fatal("expected used_pct when cap known")
+		}
+		wantPct := float64(1662) / float64(922000)
+		if *out.UsedPct != wantPct {
+			t.Fatalf("unexpected used_pct: got %v want %v", *out.UsedPct, wantPct)
+		}
+	})
+
+	t.Run("omits used_pct when cap unknown", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "budget-unknown")
+		sess.Events = []event.Event{newTestEvent("e1")}
+		ctx := ctxWithSession(sess)
+		reporter := staticBudgetReporter{
+			ok: true,
+			report: BudgetReport{
+				EstimatedTokens:     100,
+				UpperBoundTokens:    627,
+				MaxInputTokens:      128000,
+				OutputReserveTokens: 16384,
+				HeadroomTokens:      127373,
+				ContextWindowTokens: 128000,
+				CapKnown:            false,
+			},
+		}
+
+		result, err := NewCheckBudgetTool(WithBudgetReporter(reporter)).Call(ctx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(CheckBudgetOutput)
+		if out.EstimatedTokens == nil || *out.EstimatedTokens != 100 {
+			t.Fatalf("expected token fields without used_pct, got %+v", out)
+		}
+		if out.UsedPct != nil {
+			t.Fatalf("used_pct must be omitted when cap unknown, got %v", *out.UsedPct)
+		}
+	})
+
+	t.Run("reporter without snapshot keeps event counts only", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "budget-empty")
+		sess.Events = []event.Event{newTestEvent("e1")}
+		ctx := ctxWithSession(sess)
+		reporter := staticBudgetReporter{ok: false}
+
+		result, err := NewCheckBudgetTool(WithBudgetReporter(reporter)).Call(ctx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(CheckBudgetOutput)
+		if out.EstimatedTokens != nil || out.UsedPct != nil {
+			t.Fatalf("expected event counts only, got %+v", out)
+		}
+	})
+}
+
+func TestNoteToolPropagatesReporterBudget(t *testing.T) {
+	sess := session.NewSession("app", "user", "note-budget")
+	sess.Events = []event.Event{newTestEvent("e1")}
+	ctx := ctxWithSession(sess)
+	reporter := staticBudgetReporter{
+		ok: true,
+		report: BudgetReport{
+			EstimatedTokens:     50,
+			UpperBoundTokens:    569,
+			MaxInputTokens:      1000,
+			OutputReserveTokens: 100,
+			HeadroomTokens:      431,
+			ContextWindowTokens: 2000,
+			CapKnown:            true,
+		},
+	}
+
+	result, err := NewNoteTool(WithBudgetReporter(reporter)).Call(
+		ctx,
+		[]byte(`{"key":"findings","content":"ok"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := result.(NoteOutput)
+	if out.Budget == nil || out.Budget.EstimatedTokens == nil || *out.Budget.EstimatedTokens != 50 {
+		t.Fatalf("expected reporter budget on note receipt, got %+v", out.Budget)
+	}
+	if out.Budget.UsedPct == nil {
+		t.Fatal("expected used_pct on note receipt when cap known")
+	}
+}
+
+func TestListContextLargestFirstBounded(t *testing.T) {
+	sess := session.NewSession("app", "user", "lc-sized")
+	sess.Events = []event.Event{
+		{
+			ID:     "small",
+			Author: "user",
+			Response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{Role: model.RoleUser, Content: "hi"},
+				}},
+			},
+		},
+		{
+			ID:     "large",
+			Author: "tool",
+			Response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{
+						Role:    model.RoleTool,
+						Content: strings.Repeat("x", 200),
+					},
+				}},
+			},
+		},
+		{
+			ID:     "medium",
+			Author: "assistant",
+			Response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{
+						Role:    model.RoleAssistant,
+						Content: strings.Repeat("y", 40),
+					},
+				}},
+			},
+		},
+	}
+	ctx := ctxWithSession(sess)
+
+	t.Run("default order is largest first with totals", func(t *testing.T) {
+		result, err := NewListContextTool().Call(ctx, []byte(`{"limit":2}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ListContextOutput)
+		if out.Order != ListContextOrderBytesDesc {
+			t.Fatalf("expected bytes_desc, got %q", out.Order)
+		}
+		if out.TotalCount != 3 || out.Count != 2 || out.OmittedCount != 1 {
+			t.Fatalf("unexpected counts: %+v", out)
+		}
+		if out.Events[0].ID != "large" || out.Events[1].ID != "medium" {
+			t.Fatalf("expected largest-first truncation, got %+v", out.Events)
+		}
+		if out.Events[0].Bytes != 200 {
+			t.Fatalf("expected large bytes=200, got %d", out.Events[0].Bytes)
+		}
+	})
+
+	t.Run("session order preserves visible order", func(t *testing.T) {
+		result, err := NewListContextTool().Call(ctx, []byte(`{"order":"session"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ListContextOutput)
+		if out.Order != ListContextOrderSession {
+			t.Fatalf("expected session order, got %q", out.Order)
+		}
+		if out.Count != 3 || out.OmittedCount != 0 {
+			t.Fatalf("unexpected counts: %+v", out)
+		}
+		if out.Events[0].ID != "small" || out.Events[1].ID != "large" || out.Events[2].ID != "medium" {
+			t.Fatalf("expected session order, got %+v", out.Events)
+		}
+	})
+
+	t.Run("limit zero returns every visible event", func(t *testing.T) {
+		result, err := NewListContextTool().Call(ctx, []byte(`{"limit":0}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ListContextOutput)
+		if out.Count != 3 || out.OmittedCount != 0 {
+			t.Fatalf("expected all events, got %+v", out)
+		}
+	})
+}
+
+func TestListContextUTF8ByteSizing(t *testing.T) {
+	content := "你好世界" // 4 runes, 12 UTF-8 bytes
+	sess := session.NewSession("app", "user", "lc-utf8")
+	sess.Events = []event.Event{{
+		ID:     "cjk",
+		Author: "user",
+		Response: &model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{Role: model.RoleUser, Content: content},
+			}},
+		},
+	}}
+	ctx := ctxWithSession(sess)
+
+	result, err := NewListContextTool().Call(ctx, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := result.(ListContextOutput)
+	if out.Count != 1 {
+		t.Fatalf("expected 1 event, got %+v", out)
+	}
+	if out.Events[0].Bytes != len(content) {
+		t.Fatalf("expected UTF-8 byte length %d, got %d", len(content), out.Events[0].Bytes)
+	}
+	if out.Events[0].Preview != content {
+		t.Fatalf("unexpected preview: %q", out.Events[0].Preview)
+	}
+}
+
+func TestReadNotesSelectiveAndDurableReload(t *testing.T) {
+	t.Run("selective keys return only requested notes", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "rn-select")
+		sess.SetState("note:a", []byte("alpha"))
+		sess.SetState("note:b", []byte("beta"))
+		ctx := ctxWithSession(sess)
+
+		result, err := NewReadNotesTool().Call(ctx, []byte(`{"keys":["b"]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ReadNotesOutput)
+		if out.Count != 1 || out.Notes["b"] != "beta" {
+			t.Fatalf("expected only note b, got %+v", out)
+		}
+		if _, ok := out.Notes["a"]; ok {
+			t.Fatal("note a should be omitted")
+		}
+		if out.ReloadedFromStore {
+			t.Fatal("live snapshot should not reload")
+		}
+	})
+
+	t.Run("reloads durable notes when live snapshot is empty", func(t *testing.T) {
+		ctx := context.Background()
+		svc := inmemory.NewSessionService()
+		key := session.Key{AppName: "app", UserID: "user", SessionID: "rn-reload"}
+		stored, err := svc.CreateSession(ctx, key, session.StateMap{
+			"note:plan": []byte("persisted plan"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		live := session.NewSession(key.AppName, key.UserID, key.SessionID)
+		invCtx := ctxWithSessionService(live, svc)
+
+		result, err := NewReadNotesTool().Call(invCtx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ReadNotesOutput)
+		if !out.ReloadedFromStore {
+			t.Fatal("expected reloaded_from_store")
+		}
+		if out.Count != 1 || out.Notes["plan"] != "persisted plan" {
+			t.Fatalf("expected reloaded note, got %+v", out)
+		}
+		val, ok := live.GetState("note:plan")
+		if !ok || string(val) != "persisted plan" {
+			t.Fatal("expected note copied onto live session")
+		}
+		_ = stored
+	})
+
+	t.Run("reloads only missing selective keys from store", func(t *testing.T) {
+		ctx := context.Background()
+		svc := inmemory.NewSessionService()
+		key := session.Key{AppName: "app", UserID: "user", SessionID: "rn-partial"}
+		_, err := svc.CreateSession(ctx, key, session.StateMap{
+			"note:live":   []byte("from live"),
+			"note:stored": []byte("from store"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		live := session.NewSession(key.AppName, key.UserID, key.SessionID)
+		live.SetState("note:live", []byte("from live"))
+		invCtx := ctxWithSessionService(live, svc)
+
+		result, err := NewReadNotesTool().Call(invCtx, []byte(`{"keys":["live","stored"]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ReadNotesOutput)
+		if !out.ReloadedFromStore {
+			t.Fatal("expected partial reload from store")
+		}
+		if out.Notes["live"] != "from live" || out.Notes["stored"] != "from store" {
+			t.Fatalf("unexpected notes: %+v", out.Notes)
+		}
+	})
+
+	t.Run("store error leaves live snapshot in place", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "rn-fail")
+		invCtx := ctxWithSessionService(sess, &failingGetSessionService{
+			Service: noop.NewService(),
+		})
+
+		result, err := NewReadNotesTool().Call(invCtx, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := result.(ReadNotesOutput)
+		if out.Count != 0 || out.ReloadedFromStore {
+			t.Fatalf("expected empty live snapshot without reload, got %+v", out)
+		}
+	})
+}
+
+type failingGetSessionService struct {
+	*noop.Service
+}
+
+func (s *failingGetSessionService) GetSession(
+	context.Context,
+	session.Key,
+	...session.Option,
+) (*session.Session, error) {
+	return nil, errors.New("get session failed")
+}
+
+func TestDeleteContextMasksToolRoundPair(t *testing.T) {
+	sess := session.NewSession("app", "user", "dc-round")
+	sess.Events = []event.Event{
+		{
+			ID:     "call",
+			Author: "assistant",
+			Response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{
+						Role: model.RoleAssistant,
+						ToolCalls: []model.ToolCall{{
+							ID: "tc-1",
+							Function: model.FunctionDefinitionParam{
+								Name: "lookup",
+							},
+						}},
+					},
+				}},
+			},
+		},
+		{
+			ID:     "result",
+			Author: "tool",
+			Response: &model.Response{
+				Choices: []model.Choice{{
+					Message: model.Message{
+						Role:    model.RoleTool,
+						ToolID:  "tc-1",
+						Content: "payload",
+					},
+				}},
+			},
+		},
+		newTestEvent("keep"),
+	}
+	ctx := ctxWithSession(sess)
+
+	result, err := NewDeleteContextTool().Call(ctx, []byte(`{"event_ids":["result"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := result.(DeleteContextOutput)
+	if out.Masked != 2 {
+		t.Fatalf("expected both sides of the tool round masked, got %d", out.Masked)
+	}
+	visible := sess.GetVisibleEvents()
+	if len(visible) != 1 || visible[0].ID != "keep" {
+		t.Fatalf("expected only keep visible, got %+v", visible)
 	}
 }

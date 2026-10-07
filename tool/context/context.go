@@ -30,6 +30,55 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
+// BudgetReport is an optional host-supplied token accounting snapshot.
+// Hosts that assemble the real model request (messages plus tool schemas)
+// can report that size so check_budget matches the send guard.
+type BudgetReport struct {
+	EstimatedTokens     int
+	UpperBoundTokens    int
+	MaxInputTokens      int
+	OutputReserveTokens int
+	HeadroomTokens      int
+	ContextWindowTokens int
+	// CapKnown is true when MaxInputTokens is a real serving or window cap.
+	// When false, used_pct is omitted so callers do not treat a fallback
+	// window as a percentage denominator.
+	CapKnown bool
+}
+
+// BudgetReporter supplies the latest assembled-request budget for a session.
+// ReportBudget returns false when no snapshot exists yet.
+type BudgetReporter interface {
+	ReportBudget(ctx context.Context) (BudgetReport, bool)
+}
+
+// Option configures Pensieve context tools.
+type Option func(*toolsConfig)
+
+type toolsConfig struct {
+	reporter BudgetReporter
+}
+
+// WithBudgetReporter installs a host reporter used by check_budget and the
+// compact note receipt. Without a reporter, those tools return event counts
+// only.
+func WithBudgetReporter(reporter BudgetReporter) Option {
+	return func(cfg *toolsConfig) {
+		cfg.reporter = reporter
+	}
+}
+
+func applyOptions(opts ...Option) toolsConfig {
+	var cfg toolsConfig
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&cfg)
+	}
+	return cfg
+}
+
 // --- delete_context tool ---
 
 // DeleteContextInput is the input for the delete_context tool.
@@ -99,8 +148,21 @@ func NewDeleteContextTool() tool.CallableTool {
 
 // --- list_context tool ---
 
-// ListContextInput is the input for the list_context tool (empty — no args).
-type ListContextInput struct{}
+// ListContextOrderBytesDesc sorts visible events largest-first by content
+// bytes. It is the default when order is omitted.
+const ListContextOrderBytesDesc = "bytes_desc"
+
+// ListContextOrderSession keeps the session's visible-event order.
+const ListContextOrderSession = "session"
+
+// ListContextInput is the input for the list_context tool.
+type ListContextInput struct {
+	// Limit caps how many events are returned. Zero returns every visible
+	// event. Positive values keep the first Limit entries after ordering.
+	Limit int `json:"limit,omitempty" jsonschema:"description=Maximum events to return after ordering. 0 returns all visible events."`
+	// Order is bytes_desc (default) or session.
+	Order string `json:"order,omitempty" jsonschema:"description=Event ordering: bytes_desc (default, largest first) or session (visible order)."`
+}
 
 // ContextEventEntry summarises one LLM-visible session event.
 type ContextEventEntry struct {
@@ -108,12 +170,20 @@ type ContextEventEntry struct {
 	Author  string `json:"author,omitempty"`
 	Kind    string `json:"kind"`
 	Preview string `json:"preview,omitempty"`
+	// Bytes is the UTF-8 byte length of the content used to build Preview.
+	Bytes int `json:"bytes"`
 }
 
 // ListContextOutput is the output for the list_context tool.
 type ListContextOutput struct {
 	Events []ContextEventEntry `json:"events"`
 	Count  int                 `json:"count"`
+	// TotalCount is the number of visible events before applying Limit.
+	TotalCount int `json:"total_count"`
+	// OmittedCount is TotalCount minus Count when Limit truncates the list.
+	OmittedCount int `json:"omitted_count"`
+	// Order is the ordering that was applied.
+	Order string `json:"order,omitempty"`
 }
 
 const listContextPreviewMaxRunes = 120
@@ -122,35 +192,66 @@ const listContextPreviewMaxRunes = 120
 // stable IDs so the model can pass them to delete_context.
 func NewListContextTool() tool.CallableTool {
 	return function.NewFunctionTool(
-		func(ctx context.Context, _ ListContextInput) (ListContextOutput, error) {
+		func(ctx context.Context, input ListContextInput) (ListContextOutput, error) {
 			sess := sessionFromContext(ctx)
 			if sess == nil {
 				return ListContextOutput{Events: []ContextEventEntry{}}, nil
 			}
 
+			order := normalizeListContextOrder(input.Order)
 			visible := sess.GetVisibleEvents()
 			entries := make([]ContextEventEntry, 0, len(visible))
 			for _, evt := range visible {
+				content := contextEventContent(evt)
 				entries = append(entries, ContextEventEntry{
 					ID:      evt.ID,
 					Author:  evt.Author,
 					Kind:    contextEventKind(evt),
-					Preview: contextEventPreview(evt),
+					Preview: truncatePreview(content, listContextPreviewMaxRunes),
+					Bytes:   len(content),
+				})
+			}
+			if order == ListContextOrderBytesDesc {
+				sort.SliceStable(entries, func(i, j int) bool {
+					return entries[i].Bytes > entries[j].Bytes
 				})
 			}
 
+			total := len(entries)
+			omitted := 0
+			if input.Limit > 0 && len(entries) > input.Limit {
+				omitted = len(entries) - input.Limit
+				entries = entries[:input.Limit]
+			}
+
 			return ListContextOutput{
-				Events: entries,
-				Count:  len(entries),
+				Events:       entries,
+				Count:        len(entries),
+				TotalCount:   total,
+				OmittedCount: omitted,
+				Order:        order,
 			}, nil
 		},
 		function.WithName("list_context"),
 		function.WithDescription(
 			"List visible session events with stable event IDs, authors, kinds, "+
-				"and short previews. Call this before delete_context so you can "+
-				"pass real event_ids instead of guessing.",
+				"byte sizes, and short previews. Default order is largest-first "+
+				"(bytes_desc); pass order=session for visible order. Optional limit "+
+				"bounds the returned slice and reports total_count plus omitted_count. "+
+				"Call this before delete_context so you can pass real event_ids.",
 		),
 	)
+}
+
+func normalizeListContextOrder(order string) string {
+	switch strings.ToLower(strings.TrimSpace(order)) {
+	case "", ListContextOrderBytesDesc:
+		return ListContextOrderBytesDesc
+	case ListContextOrderSession:
+		return ListContextOrderSession
+	default:
+		return ListContextOrderBytesDesc
+	}
 }
 
 func contextEventKind(evt event.Event) string {
@@ -175,7 +276,8 @@ func contextEventKind(evt event.Event) string {
 	return "assistant"
 }
 
-func contextEventPreview(evt event.Event) string {
+// contextEventContent returns the flat text used for preview and byte sizing.
+func contextEventContent(evt event.Event) string {
 	if evt.Response == nil || len(evt.Response.Choices) == 0 {
 		return ""
 	}
@@ -199,12 +301,22 @@ func contextEventPreview(evt event.Event) string {
 	if content == "" {
 		return ""
 	}
-	flat := strings.Join(strings.Fields(content), " ")
-	runes := []rune(flat)
-	if len(runes) <= listContextPreviewMaxRunes {
-		return flat
+	return strings.Join(strings.Fields(content), " ")
+}
+
+func contextEventPreview(evt event.Event) string {
+	return truncatePreview(contextEventContent(evt), listContextPreviewMaxRunes)
+}
+
+func truncatePreview(content string, maxRunes int) string {
+	if content == "" {
+		return ""
 	}
-	return string(runes[:listContextPreviewMaxRunes]) + "…"
+	runes := []rune(content)
+	if len(runes) <= maxRunes {
+		return content
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 // --- check_budget tool ---
@@ -213,10 +325,19 @@ func contextEventPreview(evt event.Event) string {
 type CheckBudgetInput struct{}
 
 // CheckBudgetOutput is the output for the check_budget tool.
+// Token fields are present only when a host BudgetReporter returns a snapshot.
 type CheckBudgetOutput struct {
 	TotalEvents   int `json:"total_events"`
 	VisibleEvents int `json:"visible_events"`
 	MaskedEvents  int `json:"masked_events"`
+
+	EstimatedTokens     *int     `json:"estimated_tokens,omitempty"`
+	UpperBoundTokens    *int     `json:"upper_bound_tokens,omitempty"`
+	MaxInputTokens      *int     `json:"max_input_tokens,omitempty"`
+	OutputReserveTokens *int     `json:"output_reserve_tokens,omitempty"`
+	HeadroomTokens      *int     `json:"headroom_tokens,omitempty"`
+	ContextWindowTokens *int     `json:"context_window_tokens,omitempty"`
+	UsedPct             *float64 `json:"used_pct,omitempty"`
 }
 
 // budgetFromSession returns the event counts used by check_budget and note.
@@ -232,18 +353,54 @@ func budgetFromSession(sess *session.Session) CheckBudgetOutput {
 	}
 }
 
+func enrichBudgetWithReporter(
+	ctx context.Context,
+	out CheckBudgetOutput,
+	reporter BudgetReporter,
+) CheckBudgetOutput {
+	if reporter == nil {
+		return out
+	}
+	report, ok := reporter.ReportBudget(ctx)
+	if !ok {
+		return out
+	}
+	estimated := report.EstimatedTokens
+	upper := report.UpperBoundTokens
+	maxInput := report.MaxInputTokens
+	outputReserve := report.OutputReserveTokens
+	headroom := report.HeadroomTokens
+	window := report.ContextWindowTokens
+	out.EstimatedTokens = &estimated
+	out.UpperBoundTokens = &upper
+	out.MaxInputTokens = &maxInput
+	out.OutputReserveTokens = &outputReserve
+	out.HeadroomTokens = &headroom
+	out.ContextWindowTokens = &window
+	if report.CapKnown && maxInput > 0 {
+		pct := float64(upper) / float64(maxInput)
+		out.UsedPct = &pct
+	}
+	return out
+}
+
 // NewCheckBudgetTool creates a tool that reports the current context budget.
 // The LLM can query this to decide when to prune context.
-func NewCheckBudgetTool() tool.CallableTool {
+func NewCheckBudgetTool(opts ...Option) tool.CallableTool {
+	cfg := applyOptions(opts...)
 	return function.NewFunctionTool(
 		func(ctx context.Context, _ CheckBudgetInput) (CheckBudgetOutput, error) {
-			return budgetFromSession(sessionFromContext(ctx)), nil
+			out := budgetFromSession(sessionFromContext(ctx))
+			return enrichBudgetWithReporter(ctx, out, cfg.reporter), nil
 		},
 		function.WithName("check_budget"),
 		function.WithDescription(
 			"Check how much context budget remains. Returns total, visible, and "+
 				"masked event counts (visible uses len(GetVisibleEvents())). "+
-				"Use this proactively to decide when to prune context via delete_context.",
+				"When the host supplies assembled-request accounting, also returns "+
+				"estimated_tokens, upper_bound_tokens, max_input_tokens, and used_pct "+
+				"(only when the input cap is known). Use this proactively to decide "+
+				"when to prune context via delete_context.",
 		),
 	)
 }
@@ -315,7 +472,8 @@ type NoteOutput struct {
 // Notes survive context pruning (delete_context) — they are stored in session
 // state, not in the event stream. Use this to distill key information before
 // pruning the raw context that contained it.
-func NewNoteTool() tool.CallableTool {
+func NewNoteTool(opts ...Option) tool.CallableTool {
+	cfg := applyOptions(opts...)
 	return function.NewFunctionTool(
 		func(ctx context.Context, input NoteInput) (NoteOutput, error) {
 			inv, ok := agent.InvocationFromContext(ctx)
@@ -342,7 +500,11 @@ func NewNoteTool() tool.CallableTool {
 
 			inv.Session.SetState(keyStr, byteContent)
 
-			budget := budgetFromSession(inv.Session)
+			budget := enrichBudgetWithReporter(
+				ctx,
+				budgetFromSession(inv.Session),
+				cfg.reporter,
+			)
 			return NoteOutput{
 				Message: fmt.Sprintf("note '%s' saved (%d bytes)", input.Key, len(input.Content)),
 				Saved: &NoteSaveReceipt{
@@ -365,33 +527,31 @@ func NewNoteTool() tool.CallableTool {
 }
 
 // ReadNotesInput is the input for the read_notes tool.
-type ReadNotesInput struct{}
+type ReadNotesInput struct {
+	// Keys selects specific notes. Empty returns every note.
+	Keys []string `json:"keys,omitempty" jsonschema:"description=Optional note keys to read. Empty returns all notes."`
+}
 
 // ReadNotesOutput is the output for the read_notes tool.
 type ReadNotesOutput struct {
 	Notes map[string]string `json:"notes"`
 	Count int               `json:"count"`
+	// ReloadedFromStore is true when at least one note body was copied from
+	// SessionService onto the live session because the live snapshot was stale.
+	ReloadedFromStore bool `json:"reloaded_from_store,omitempty"`
 }
 
-// NewReadNotesTool creates a tool that lists all persistent notes.
+// NewReadNotesTool creates a tool that lists persistent notes.
 // The LLM uses this to recall distilled information after pruning context.
 func NewReadNotesTool() tool.CallableTool {
 	return function.NewFunctionTool(
-		func(ctx context.Context, _ ReadNotesInput) (ReadNotesOutput, error) {
-			sess := sessionFromContext(ctx)
-			if sess == nil {
+		func(ctx context.Context, input ReadNotesInput) (ReadNotesOutput, error) {
+			inv, ok := agent.InvocationFromContext(ctx)
+			if !ok || inv == nil || inv.Session == nil {
 				return ReadNotesOutput{Notes: map[string]string{}}, nil
 			}
 
-			snapshot := sess.SnapshotState()
-			notes := make(map[string]string)
-			for k, v := range snapshot {
-				if strings.HasPrefix(k, noteKeyPrefix) {
-					notes[strings.TrimPrefix(k, noteKeyPrefix)] = string(v)
-				}
-			}
-
-			// Sort keys for deterministic output.
+			notes, reloaded := loadNotes(ctx, inv, input.Keys)
 			keys := make([]string, 0, len(notes))
 			for k := range notes {
 				keys = append(keys, k)
@@ -404,17 +564,99 @@ func NewReadNotesTool() tool.CallableTool {
 			}
 
 			return ReadNotesOutput{
-				Notes: ordered,
-				Count: len(ordered),
+				Notes:             ordered,
+				Count:             len(ordered),
+				ReloadedFromStore: reloaded,
 			}, nil
 		},
 		function.WithName("read_notes"),
 		function.WithDescription(
-			"Read all persistent notes previously saved via the note tool. "+
+			"Read persistent notes previously saved via the note tool. "+
+				"Pass keys to fetch specific notes; omit keys to return all. "+
 				"Returns a map of key→content. Use this to recall distilled "+
 				"information after pruning raw context.",
 		),
 	)
+}
+
+// loadNotes returns note bodies from the live session, reloading from the
+// session service when the live snapshot is missing notes the caller needs.
+func loadNotes(
+	ctx context.Context,
+	inv *agent.Invocation,
+	wantKeys []string,
+) (map[string]string, bool) {
+	notes := notesFromSnapshot(inv.Session.SnapshotState(), wantKeys)
+	if !needsNoteReload(notes, wantKeys) {
+		return notes, false
+	}
+	if inv.SessionService == nil {
+		return notes, false
+	}
+
+	key := session.Key{
+		AppName:   inv.Session.AppName,
+		UserID:    inv.Session.UserID,
+		SessionID: inv.Session.ID,
+	}
+	loaded, err := inv.SessionService.GetSession(ctx, key)
+	if err != nil || loaded == nil {
+		return notes, false
+	}
+
+	reloaded := false
+	for stateKey, body := range loaded.SnapshotState() {
+		if !strings.HasPrefix(stateKey, noteKeyPrefix) {
+			continue
+		}
+		name := strings.TrimPrefix(stateKey, noteKeyPrefix)
+		if len(wantKeys) > 0 && !containsString(wantKeys, name) {
+			continue
+		}
+		if _, ok := notes[name]; ok {
+			continue
+		}
+		inv.Session.SetState(stateKey, body)
+		notes[name] = string(body)
+		reloaded = true
+	}
+	return notes, reloaded
+}
+
+func notesFromSnapshot(snapshot session.StateMap, wantKeys []string) map[string]string {
+	notes := make(map[string]string)
+	for k, v := range snapshot {
+		if !strings.HasPrefix(k, noteKeyPrefix) {
+			continue
+		}
+		name := strings.TrimPrefix(k, noteKeyPrefix)
+		if len(wantKeys) > 0 && !containsString(wantKeys, name) {
+			continue
+		}
+		notes[name] = string(v)
+	}
+	return notes
+}
+
+func needsNoteReload(notes map[string]string, wantKeys []string) bool {
+	if len(wantKeys) == 0 {
+		return len(notes) == 0
+	}
+	for _, key := range wantKeys {
+		if _, ok := notes[key]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // --- notes_index tool ---
@@ -540,12 +782,14 @@ func NewNotesIndexTool() tool.CallableTool {
 }
 
 // Tools returns all context management tools as a convenience.
-func Tools() []tool.Tool {
+// Optional WithBudgetReporter attaches host token accounting to check_budget
+// and the note receipt.
+func Tools(opts ...Option) []tool.Tool {
 	return []tool.Tool{
 		NewListContextTool(),
 		NewDeleteContextTool(),
-		NewCheckBudgetTool(),
-		NewNoteTool(),
+		NewCheckBudgetTool(opts...),
+		NewNoteTool(opts...),
 		NewReadNotesTool(),
 		NewNotesIndexTool(),
 	}
