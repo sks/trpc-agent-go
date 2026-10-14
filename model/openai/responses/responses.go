@@ -12,6 +12,7 @@ package responses
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/openai/openai-go/v3"
@@ -26,11 +27,18 @@ type Model struct {
 	client            openai.Client
 	name              string
 	store             bool
+	useWebSocket      bool
 	channelBufferSize int
 	extraFields       map[string]any
 	requestCallback   RequestCallbackFunc
 	responseCallback  ResponseCallbackFunc
 	streamCallback    StreamEventCallbackFunc
+	steerCallback     SteerSessionCallback
+
+	wsMu             sync.Mutex
+	wsConn           *responses.ResponseConnection
+	keepWSConn       bool
+	stickyPreviousID string
 }
 
 // New creates a Responses API adapter. The root trpc-agent-go module is
@@ -55,11 +63,13 @@ func New(name string, opts ...Option) *Model {
 		client:            openai.NewClient(clientOpts...),
 		name:              name,
 		store:             o.store,
+		useWebSocket:      o.useWebSocket,
 		channelBufferSize: o.channelBufferSize,
 		extraFields:       o.extraFields,
 		requestCallback:   o.requestCallback,
 		responseCallback:  o.responseCallback,
 		streamCallback:    o.streamCallback,
+		steerCallback:     o.steerCallback,
 	}
 }
 
@@ -97,7 +107,7 @@ func (m *Model) GenerateContent(
 			}
 		}
 		if request.Stream {
-			m.handleStreaming(ctx, params, reqOpts, emit)
+			m.handleStreamingOrWS(ctx, params, reqOpts, emit)
 			return
 		}
 		m.handleNonStreaming(ctx, params, reqOpts, emit)

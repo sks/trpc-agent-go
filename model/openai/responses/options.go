@@ -51,6 +51,7 @@ type options struct {
 	apiKey            string
 	baseURL           string
 	store             bool
+	useWebSocket      bool
 	channelBufferSize int
 	httpClientOptions []HTTPClientOption
 	openaiOptions     []option.RequestOption
@@ -58,6 +59,7 @@ type options struct {
 	requestCallback   RequestCallbackFunc
 	responseCallback  ResponseCallbackFunc
 	streamCallback    StreamEventCallbackFunc
+	steerCallback     SteerSessionCallback
 }
 
 func defaultOptions() options {
@@ -152,5 +154,23 @@ func WithResponseCallback(cb ResponseCallbackFunc) Option {
 func WithStreamEventCallback(cb StreamEventCallbackFunc) Option {
 	return func(o *options) {
 		o.streamCallback = cb
+	}
+}
+
+// WithWebSocket enables Responses WebSocket transport for streaming calls.
+// Required for mid-turn response.steer (GPT-6). When Connect fails, the
+// adapter falls back to HTTP SSE.
+func WithWebSocket(enable bool) Option {
+	return func(o *options) {
+		o.useWebSocket = enable
+	}
+}
+
+// WithSteerSessionCallback registers a callback invoked when a WebSocket
+// mid-turn session becomes available (non-nil) or ends (nil). Hosts use this
+// to wire InjectFeedback to response.steer.
+func WithSteerSessionCallback(cb SteerSessionCallback) Option {
+	return func(o *options) {
+		o.steerCallback = cb
 	}
 }
