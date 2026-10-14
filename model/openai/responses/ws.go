@@ -332,7 +332,31 @@ func createEventFromParams(params responses.ResponseNewParams) (responses.Respon
 	// WebSocket create must not set HTTP stream/background transport fields.
 	event.Stream = param.Opt[bool]{}
 	event.Background = param.Opt[bool]{}
+	// HTTP New params use OfInputItemList; WS create uses OfResponse for the
+	// same item-list shape. JSON round-trip drops that variant as null, so
+	// copy input explicitly or response.create runs with empty input.
+	event.Input = createInputFromParams(params.Input)
 	return event, nil
+}
+
+// createInputFromParams maps ResponseNewParams.Input onto the WS create union.
+// Without this, message-list inputs become null after createEventFromParams
+// round-trip and the WebSocket stream fails immediately.
+func createInputFromParams(
+	input responses.ResponseNewParamsInputUnion,
+) responses.ResponsesClientEventResponseCreateInputUnionParam {
+	if !param.IsOmitted(input.OfString) {
+		return responses.ResponsesClientEventResponseCreateInputUnionParam{
+			OfString: input.OfString,
+		}
+	}
+	if len(input.OfInputItemList) == 0 {
+		return responses.ResponsesClientEventResponseCreateInputUnionParam{}
+	}
+	list := input.OfInputItemList
+	return responses.ResponsesClientEventResponseCreateInputUnionParam{
+		OfResponse: &list,
+	}
 }
 
 func wsEventToStreamEvent(event responses.ResponsesServerEventUnion) (responses.ResponseStreamEventUnion, bool) {
