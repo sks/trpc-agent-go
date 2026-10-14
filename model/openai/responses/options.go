@@ -168,7 +168,7 @@ func WithWebSocket(enable bool) Option {
 
 // WithSteerSessionCallback registers a callback invoked when a WebSocket
 // mid-turn session becomes available (non-nil) or ends (nil). Hosts use this
-// to wire InjectFeedback to response.steer.
+// to attach MidTurnSession to an active run for response.steer.
 func WithSteerSessionCallback(cb SteerSessionCallback) Option {
 	return func(o *options) {
 		o.steerCallback = cb

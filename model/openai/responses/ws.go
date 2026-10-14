@@ -30,15 +30,17 @@ const (
 	incompleteReasonSteered    = "steered"
 )
 
-// MidTurnSession steers an in-flight Responses WebSocket generation.
-// Genie registers this with runsteer so /api/v1/inject can call response.steer.
+// MidTurnSession steers an in-flight Responses WebSocket generation via
+// response.steer. Hosts attach this to an active run so mid-turn user input
+// can reach the model without waiting for the next assistant round boundary.
 type MidTurnSession interface {
 	Steer(ctx context.Context, input string) error
 	ResponseID() string
 }
 
-// SteerSessionCallback is invoked once response.created yields an ID so hosts
-// can attach MidTurnSession to an active run. Cleared when the session ends.
+// SteerSessionCallback is invoked when a WebSocket mid-turn session becomes
+// available (and again with nil when it ends) so hosts can attach or clear a
+// MidTurnSession on the active run.
 type SteerSessionCallback func(ctx context.Context, session MidTurnSession)
 
 // midTurnSession is the live steerer for one WebSocket GenerateContent call.
