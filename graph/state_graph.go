@@ -38,6 +38,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/internal/jsonrepair"
 	promptstate "trpc.group/trpc-go/trpc-agent-go/internal/prompt/adapter/state"
 	"trpc.group/trpc-go/trpc-agent-go/internal/responseusage"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/messageprojection"
 	istructure "trpc.group/trpc-go/trpc-agent-go/internal/structure"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
@@ -48,6 +49,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	semconvtrace "trpc.group/trpc-go/trpc-agent-go/telemetry/semconv/trace"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -129,6 +131,8 @@ func WithNodeType(nodeType NodeType) Option {
 
 // WithUserInputKey sets the state key used as one-shot user input for LLM and
 // Agent nodes. When empty, StateKeyUserInput is used.
+// Non-default keys keep the legacy override path and do not opt into the LLM
+// node's retention of unchanged ContentParts-derived input.
 func WithUserInputKey(key string) Option {
 	return func(node *Node) {
 		node.userInputKey = key
@@ -1368,8 +1372,25 @@ func (r *llmRunner) executeUserInputStage(
 	var ops []MessageOp
 	if len(used) > 0 && used[len(used)-1].Role == model.RoleUser {
 		if used[len(used)-1].Content != userInput {
-			used[len(used)-1] = model.NewUserMessage(userInput)
-			ops = append(ops, ReplaceLastUser{Content: userInput})
+			if userInputKey == StateKeyUserInput &&
+				matchesPartsUserInputOrigin(state, userInput) {
+				// Keep the final invocation projection, including Content-only
+				// messages produced by an event projector.
+			} else if resolved, ok := resolveProjectedCurrentUser(
+				state,
+				used[len(used)-1],
+				userInput,
+			); ok {
+				if !model.MessagesEqual(resolved, used[len(used)-1]) {
+					used[len(used)-1] = resolved
+					ops = append(ops, ReplaceLastUser{
+						Content: resolved.Content,
+					})
+				}
+			} else {
+				used[len(used)-1] = model.NewUserMessage(userInput)
+				ops = append(ops, ReplaceLastUser{Content: userInput})
+			}
 		}
 	} else {
 		used = append(used, model.NewUserMessage(userInput))
@@ -1395,6 +1416,22 @@ func (r *llmRunner) executeUserInputStage(
 			r.nodeID: asst.Content,
 		},
 	}, nil
+}
+
+func resolveProjectedCurrentUser(
+	state State,
+	msg model.Message,
+	userInput string,
+) (model.Message, bool) {
+	execCtx := executionContextFromState(state)
+	if execCtx == nil {
+		return model.Message{}, false
+	}
+	return messageprojection.ResolveCurrentUser(
+		execCtx.Invocation,
+		msg,
+		userInput,
+	)
 }
 
 func (r *llmRunner) executeHistoryStage(ctx context.Context, state State, span oteltrace.Span) (any, error) {
@@ -2173,7 +2210,7 @@ func processModelResponse(ctx context.Context, config modelResponseConfig) (cont
 				config.Response.Error.Message,
 			),
 		)
-		return ctx, nil, fmt.Errorf(
+		return ctx, llmEvent, fmt.Errorf(
 			"model API error: %s",
 			config.Response.Error.Message,
 		)
@@ -4213,7 +4250,7 @@ func runAfterToolPluginCallbacks(
 	}
 
 	callbacks := invocation.Plugins.ToolCallbacks()
-	if callbacks == nil {
+	if callbacks == nil || len(callbacks.AfterTool) == 0 {
 		return ctx, nil, nil
 	}
 
@@ -4236,6 +4273,10 @@ func runAfterToolPluginCallbacks(
 	if errors.As(runErr, &interruptErr) {
 		return ctx, nil, runErr
 	}
+	// A non-nil CustomResult from a registered AfterTool hook is an explicit
+	// plugin replacement and skips node AfterTool callbacks. An empty
+	// AfterTool list is skipped above so the released no-callback echo of
+	// args.Result is not treated as an override.
 	if afterResult != nil && afterResult.CustomResult != nil {
 		if err != nil {
 			return ctx, afterResult.CustomResult,
@@ -5313,6 +5354,7 @@ func (p *modelResponseProcessor) handleResponse(response *model.Response) (bool,
 	p.toolCalls = collectToolCallsFromResponse(p.toolCalls, response)
 	p.finalResponse = response
 	reusableEvent := nextReusableModelEvent(p.reusableEvents, &p.reusableEventIdx)
+	var responseErr error
 	if p.fastResponsePath {
 		responseusage.AttachTiming(response, p.timingInfo, &p.partialUsageState)
 		lastEvent, err := emitFastModelResponseEvent(
@@ -5326,12 +5368,9 @@ func (p *modelResponseProcessor) handleResponse(response *model.Response) (bool,
 			reusableEvent,
 		)
 		p.lastEvent = lastEvent
-		if err != nil {
-			return false, err
-		}
+		responseErr = err
 	} else {
-		var err error
-		p.ctx, p.lastEvent, err = processModelResponse(p.ctx, modelResponseConfig{
+		p.ctx, p.lastEvent, responseErr = processModelResponse(p.ctx, modelResponseConfig{
 			Response:         response,
 			Invocation:       p.invocation,
 			StableInvocation: p.stableInvocation,
@@ -5346,9 +5385,6 @@ func (p *modelResponseProcessor) handleResponse(response *model.Response) (bool,
 			Span:             p.config.Span,
 			NodeID:           p.config.NodeID,
 		})
-		if err != nil {
-			return false, err
-		}
 	}
 	p.invocation = invocationFromContextOrDefault(p.ctx, p.invocation)
 	p.observabilityInvocation = refreshObservabilityInvocationView(
@@ -5356,6 +5392,10 @@ func (p *modelResponseProcessor) handleResponse(response *model.Response) (bool,
 		p.stableInvocation,
 		p.config,
 	)
+	// Trace the same processed response used by metrics, including callback replacements.
+	if p.lastEvent != nil {
+		response = p.lastEvent.Response
+	}
 	traceProcessedModelResponse(
 		p.config.Span,
 		&p.chatTraceState,
@@ -5365,12 +5405,30 @@ func (p *modelResponseProcessor) handleResponse(response *model.Response) (bool,
 		response,
 		p.lastEvent,
 	)
+	if responseErr != nil {
+		return false, responseErr
+	}
 	return true, nil
 }
 
 func (p *modelResponseProcessor) finalize() (*model.Response, error) {
 	finalResponse, err := validateFinalModelResponse(p.config.Span, p.finalResponse)
 	if err != nil {
+		if !tracingDisabled(p.invocation) && p.config.Span.IsRecording() {
+			// Final validation can fail after a callback supplied a successful response.
+			// Keep that response's trace attributes and record the final failure used by metrics.
+			p.chatTraceState.TraceChat(p.config.Span, &itelemetry.TraceChatAttributes{
+				Invocation: p.observabilityInvocation,
+				Request:    p.config.Request,
+			})
+			p.config.Span.SetAttributes(
+				attribute.String(semconvtrace.KeyErrorType,
+					itelemetry.ToErrorType(err, semconvtrace.ValueDefaultErrorType)),
+				attribute.String(semconvtrace.KeyErrorMessage, err.Error()),
+			)
+			p.config.Span.SetStatus(codes.Error, err.Error())
+			p.config.Span.RecordError(err)
+		}
 		return nil, err
 	}
 	mergeToolCallsIntoFinalResponse(finalResponse, p.toolCalls)

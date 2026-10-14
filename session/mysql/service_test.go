@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -144,12 +145,19 @@ func expectLimitedEventRefsWithTimestamp(
 	limit int,
 	refs ...eventRef,
 ) *sqlmock.ExpectedQuery {
-	rows := sqlmock.NewRows([]string{"id", "created_at", "event_timestamp"})
-	for _, ref := range refs {
-		rows.AddRow(ref.id, ref.createdAt, ref.eventTimestamp.Format(time.RFC3339Nano))
+	expectation := expectLimitedEventRefs(mock, key, afterTime, limit, refs...)
+	if len(refs) == 0 {
+		return expectation
 	}
-	return mock.ExpectQuery(regexp.QuoteMeta("SELECT id, created_at, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM session_events")).
-		WithArgs(key.AppName, key.UserID, key.SessionID, afterTime, limit).
+	rows := sqlmock.NewRows([]string{"id", "event_timestamp"})
+	args := make([]driver.Value, 0, len(refs)+1)
+	for _, ref := range refs {
+		args = append(args, ref.id)
+		rows.AddRow(ref.id, ref.eventTimestamp.Format(time.RFC3339Nano))
+	}
+	args = append(args, key.UserID)
+	return mock.ExpectQuery(regexp.QuoteMeta("SELECT id, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM session_events")).
+		WithArgs(args...).
 		WillReturnRows(rows)
 }
 
@@ -175,11 +183,11 @@ func expectFullSessionEventsList(
 	key session.Key,
 	rows ...limitedEventRow,
 ) *sqlmock.ExpectedQuery {
-	sqlRows := sqlmock.NewRows([]string{"app_name", "user_id", "session_id", "event", "created_at"})
-	for _, row := range rows {
-		sqlRows.AddRow(key.AppName, key.UserID, key.SessionID, row.event, row.createdAt)
+	sqlRows := sqlmock.NewRows([]string{"app_name", "user_id", "session_id", "event", "created_at", "id"})
+	for i, row := range rows {
+		sqlRows.AddRow(key.AppName, key.UserID, key.SessionID, row.event, row.createdAt, int64(i+1))
 	}
-	return mock.ExpectQuery(regexp.QuoteMeta("SELECT app_name, user_id, session_id, event, created_at FROM")).
+	return mock.ExpectQuery(regexp.QuoteMeta("SELECT app_name, user_id, session_id, event, created_at, id FROM")).
 		WithArgs(key.AppName, key.UserID, key.SessionID, key.UserID).
 		WillReturnRows(sqlRows)
 }
@@ -207,9 +215,9 @@ func expectNoUserAnchorWithTimestamp(
 	args := []driver.Value{key.AppName, key.UserID, key.SessionID, sessionCreatedAt}
 	args = append(args, extraArgs...)
 	args = append(args, userAnchorSearchBatchSize)
-	return mock.ExpectQuery(regexp.QuoteMeta("SELECT id, created_at, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM session_events")).
+	return mock.ExpectQuery(regexp.QuoteMeta("SELECT id, created_at FROM session_events")).
 		WithArgs(args...).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "event_timestamp"}))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}))
 }
 
 func expectPreviousEventRefs(
@@ -221,7 +229,8 @@ func expectPreviousEventRefs(
 ) *sqlmock.ExpectedQuery {
 	args := []driver.Value{key.AppName, key.UserID, key.SessionID, sessionCreatedAt}
 	if before != nil {
-		args = append(args, before.createdAt)
+		// Composite keyset cursor binds (created_at, created_at, id).
+		args = append(args, before.createdAt, before.createdAt, before.id)
 	}
 	args = append(args, userAnchorSearchBatchSize)
 	rows := sqlmock.NewRows([]string{"id", "created_at"})
@@ -1411,6 +1420,155 @@ func TestSoftDeleteSessionsChildErrors(t *testing.T) {
 	}
 }
 
+func TestSoftDeleteSessionsFallsBackForLegacySummaryDuplicates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	s := createTestService(t, db)
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_states SET deleted_at = ?")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+		WillReturnError(&mysql.MySQLError{
+			Number:  sqldb.MySQLErrDuplicateEntry,
+			Message: "duplicate active summary",
+		})
+	mock.ExpectQuery(regexp.QuoteMeta(
+		"SELECT id, user_id FROM session_summaries WHERE (app_name = ?) AND deleted_at IS NULL ORDER BY id ASC FOR UPDATE",
+	)).
+		WithArgs("app-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).
+			AddRow(int64(101), "user-1").
+			AddRow(int64(102), "user-1").
+			AddRow(int64(201), "user-2"))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+		WithArgs(sqlmock.AnyArg(), int64(101), "user-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+		WithArgs(sqlmock.AnyArg(), int64(102), "user-1").
+		WillReturnError(&mysql.MySQLError{
+			Number:  sqldb.MySQLErrDuplicateEntry,
+			Message: "duplicate active summary",
+		})
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM session_summaries")).
+		WithArgs(int64(102), "user-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+		WithArgs(sqlmock.AnyArg(), int64(201), "user-2").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_events SET deleted_at = ?")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE session_track_events SET deleted_at = ?")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	err = s.softDeleteSessions(
+		context.Background(),
+		tx,
+		"app_name = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+		[]any{"app-1", time.Now()},
+		"app_name = ?",
+		[]any{"app-1"},
+		time.Now(),
+	)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSoftDeleteSummariesIndividualFallbackErrors(t *testing.T) {
+	duplicateErr := &mysql.MySQLError{
+		Number:  sqldb.MySQLErrDuplicateEntry,
+		Message: "duplicate active summary",
+	}
+	tests := []struct {
+		name           string
+		expectFallback func(sqlmock.Sqlmock)
+		wantErr        string
+	}{
+		{
+			name: "query rows",
+			expectFallback: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id FROM session_summaries")).
+					WillReturnError(assert.AnError)
+			},
+			wantErr: "query active summaries",
+		},
+		{
+			name: "scan row",
+			expectFallback: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id FROM session_summaries")).
+					WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).AddRow(nil, "user-1"))
+			},
+			wantErr: "scan active summary",
+		},
+		{
+			name: "iterate rows",
+			expectFallback: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id FROM session_summaries")).
+					WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).
+						AddRow(int64(101), "user-1").
+						RowError(0, assert.AnError))
+			},
+			wantErr: "iterate active summaries",
+		},
+		{
+			name: "update row",
+			expectFallback: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id FROM session_summaries")).
+					WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).
+						AddRow(int64(101), "user-1"))
+				mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+					WithArgs(sqlmock.AnyArg(), int64(101), "user-1").
+					WillReturnError(assert.AnError)
+			},
+			wantErr: "soft delete summary 101 individually",
+		},
+		{
+			name: "delete duplicate row",
+			expectFallback: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id, user_id FROM session_summaries")).
+					WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).
+						AddRow(int64(101), "user-1"))
+				mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+					WithArgs(sqlmock.AnyArg(), int64(101), "user-1").
+					WillReturnError(duplicateErr)
+				mock.ExpectExec(regexp.QuoteMeta("DELETE FROM session_summaries")).
+					WithArgs(int64(101), "user-1").
+					WillReturnError(assert.AnError)
+			},
+			wantErr: "delete duplicate active summary 101",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer db.Close()
+
+			s := createTestService(t, db)
+			mock.ExpectBegin()
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE session_summaries SET deleted_at = ?")).
+				WillReturnError(duplicateErr)
+			tt.expectFallback(mock)
+			mock.ExpectRollback()
+
+			tx, err := db.Begin()
+			require.NoError(t, err)
+			err = s.softDeleteSummaries(
+				context.Background(), tx, "app_name = ?", []any{"app-1"}, time.Now(),
+			)
+			require.ErrorContains(t, err, tt.wantErr)
+			require.NoError(t, tx.Rollback())
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 func TestHardDeleteSessionsChildErrors(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -2265,9 +2423,9 @@ func TestListSessions_WithEvents(t *testing.T) {
 	eventBytes, _ := json.Marshal(evt)
 
 	// Mock: Batch load events with data
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT app_name, user_id, session_id, event, created_at FROM")).
-		WillReturnRows(sqlmock.NewRows([]string{"app_name", "user_id", "session_id", "event", "created_at"}).
-			AddRow(userKey.AppName, userKey.UserID, "session-1", eventBytes, time.Now()))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT app_name, user_id, session_id, event, created_at, id FROM")).
+		WillReturnRows(sqlmock.NewRows([]string{"app_name", "user_id", "session_id", "event", "created_at", "id"}).
+			AddRow(userKey.AppName, userKey.UserID, "session-1", eventBytes, time.Now(), int64(1)))
 
 	// Prepare mock summary
 	summary := session.Summary{Summary: "test summary", Topics: []string{}}
@@ -2456,7 +2614,7 @@ func TestGetTrackEvents_ZeroAfterTimeOmitsCreatedAtFilter(t *testing.T) {
 		`WHERE app_name = \? AND user_id = \? AND session_id = \? AND track = \?\s+`+
 		`AND \(expires_at IS NULL OR expires_at > \?\)\s+`+
 		`AND deleted_at IS NULL\s+`+
-		`ORDER BY created_at DESC$`).
+		`ORDER BY created_at DESC, id DESC$`).
 		WithArgs("test-app", "test-user", "session-1", "alpha", sqlmock.AnyArg()).
 		WillReturnRows(rows)
 
@@ -2497,7 +2655,7 @@ func TestGetTrackEvents_AfterTimeBindsCreatedAtFilter(t *testing.T) {
 		`AND \(expires_at IS NULL OR expires_at > \?\)\s+`+
 		`AND deleted_at IS NULL\s+`+
 		`AND created_at > \?\s+`+
-		`ORDER BY created_at DESC$`).
+		`ORDER BY created_at DESC, id DESC$`).
 		WithArgs("test-app", "test-user", "session-1", "alpha", sqlmock.AnyArg(), afterTime).
 		WillReturnRows(sqlmock.NewRows([]string{"event"}))
 
@@ -3670,8 +3828,8 @@ func mockDBInitWithPrefix(mock sqlmock.Sqlmock, tablePrefix string) {
 			WithArgs(fullTableName).
 			WillReturnRows(colRows)
 
-		// 3. verifyIndexes query (INDEX_NAME, COLUMN_NAME, NON_UNIQUE)
-		idxRows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "NON_UNIQUE"})
+		// 3. verifyIndexes query (INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SUB_PART)
+		idxRows := sqlmock.NewRows([]string{"INDEX_NAME", "COLUMN_NAME", "NON_UNIQUE", "SUB_PART"})
 		for _, idx := range schema.indexes {
 			idxName := sqldb.BuildIndexName(tablePrefix, idx.table, idx.suffix)
 			nonUnique := 1
@@ -3679,10 +3837,10 @@ func mockDBInitWithPrefix(mock sqlmock.Sqlmock, tablePrefix string) {
 				nonUnique = 0
 			}
 			for _, col := range idx.columns {
-				idxRows.AddRow(idxName, col, nonUnique)
+				idxRows.AddRow(idxName, col, nonUnique, nil)
 			}
 		}
-		idxRows.AddRow("PRIMARY", "id", 0)
+		idxRows.AddRow("PRIMARY", "id", 0, nil)
 		mock.ExpectQuery("SELECT INDEX_NAME").
 			WithArgs(fullTableName).
 			WillReturnRows(idxRows)

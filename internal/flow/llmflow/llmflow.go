@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,7 +39,10 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/internal/responseusage"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/steer"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryfork"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryinject"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/summaryview"
+	"trpc.group/trpc-go/trpc-agent-go/internal/summarydiag"
+	"trpc.group/trpc-go/trpc-agent-go/internal/summarytoken"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
 	"trpc.group/trpc-go/trpc-agent-go/internal/toolcall"
@@ -70,6 +74,23 @@ const (
 	defaultContextCompactionThresholdRatio = 0.7
 	contextCompactionFallbackWindow        = 8192
 	contextCompactionMinTokens             = 2000
+
+	contextCompactionOutcomeSuccess            = "success"
+	contextCompactionOutcomeNoUpdate           = "no_update"
+	contextCompactionOutcomeSummaryError       = "summary_error"
+	contextCompactionOutcomeRebuildUnavailable = "rebuild_unavailable"
+	contextCompactionOutcomePersistenceError   = "persistence_error"
+	contextCompactionOutcomePostCountError     = "post_count_error"
+
+	// Session summary injection outcomes report whether a stored summary
+	// selected for this request is still observable in the same framework
+	// model.Request after the response sequence has been observed. They do
+	// not describe a provider's final payload.
+	summaryInjectionOutcomeBlockTextPresent = "block_text_present"
+	summaryInjectionOutcomeBlockTextMissing = "block_text_missing"
+	summaryInjectionOutcomeNotSelected      = "not_selected"
+	summaryInjectionOutcomeLookupMiss       = "lookup_miss"
+	summaryInjectionOutcomeScopeMismatch    = "scope_mismatch"
 )
 
 // InvocationHasFilteredUserTools reports whether the cached filtered tool
@@ -1573,8 +1594,31 @@ func (f *Flow) preprocess(
 		finishLatencySpan(stageSpan, stageStarted, nil)
 	}
 	// Sanitize invalid tool calls in history to avoid poisoning future requests.
-	llmRequest.Messages = toolcall.SanitizeMessagesWithTools(ctx, llmRequest.Messages, llmRequest.Tools)
+	sanitizeRequestMessages(ctx, invocation, llmRequest)
 	return rebuildPlan
+}
+
+func sanitizeRequestMessages(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	req *model.Request,
+) {
+	if req == nil {
+		return
+	}
+	before := req.Messages
+	result := toolcall.SanitizeMessagesWithToolsResult(
+		ctx,
+		before,
+		req.Tools,
+	)
+	req.Messages = result.Messages
+	summaryview.RebaseAfterTransform(
+		invocation,
+		before,
+		result.Messages,
+		result.SourceIndexes,
+	)
 }
 
 func normalizeContextCompactionThresholdRatio(ratio float64) float64 {
@@ -1658,6 +1702,7 @@ func (f *Flow) runContextCompaction(
 	rebuildPlan *contextCompactionRebuildPlan,
 	decision contextCompactionDecision,
 ) *model.Request {
+	startedAt := time.Now()
 	decisionRequest := requestWithCallLimitFinalizationMessage(
 		req,
 		rebuildPlan.callLimitFinalizationMessage,
@@ -1687,8 +1732,58 @@ func (f *Flow) runContextCompaction(
 		contextCompactionAttrs(decision, decisionRequest)...,
 	)
 	summaryCtx = summary.ContextWithCacheSafeForkRequest(summaryCtx, req)
-	if view, ok := summaryview.Snapshot(invocation); ok {
+	view, viewPresent := summaryview.Snapshot(invocation)
+	if viewPresent {
 		summaryCtx = summaryview.ContextWithView(summaryCtx, view)
+	}
+	var usedRebuild bool
+	logResult := func(
+		outcome string,
+		result *model.Request,
+		postRequestTokens int,
+	) {
+		// After a rebuild, even when the post-rebuild token count fails,
+		// the invocation holds the latest view. Paths that never rebuild
+		// keep the snapshot frozen before summarization.
+		binding := summaryview.BindingFromContext(summaryCtx)
+		if usedRebuild {
+			binding = summaryview.BindingFromInvocation(invocation)
+		}
+		filterKeyDisplay, filterKeyTruncated :=
+			summarydiag.FormatFilterKey(filterKey)
+		format := "Pre-LLM context compaction result: schema_version=%d, " +
+			"outcome=%s, agent=%q, agent_truncated=%t, filter_key=%q, " +
+			"filter_key_truncated=%t, " +
+			"request_tokens=%d, threshold=%d, " +
+			"context_window=%d, messages=%d->%d, post_request_tokens=%d, " +
+			"summary_view_present=%t, summary_view_bound=%t, " +
+			"summary_view_items=%d, binding_reason=%s, duration_ms=%d"
+		agentName, agentTruncated :=
+			summarydiag.FormatAgentName(invocation.AgentName)
+		args := []any{
+			summarydiag.SchemaVersion,
+			outcome,
+			agentName,
+			agentTruncated,
+			filterKeyDisplay,
+			filterKeyTruncated,
+			decision.tokenCount,
+			decision.threshold,
+			decision.contextWindow,
+			len(decisionRequest.Messages),
+			len(result.Messages),
+			postRequestTokens,
+			binding.Present,
+			binding.Bound,
+			binding.Items,
+			binding.Reason,
+			time.Since(startedAt).Milliseconds(),
+		}
+		if outcome == contextCompactionOutcomeSuccess {
+			log.InfofContext(ctx, format, args...)
+			return
+		}
+		log.WarnfContext(ctx, format, args...)
 	}
 	err := invocation.SessionService.CreateSessionSummary(
 		summaryCtx,
@@ -1724,14 +1819,11 @@ func (f *Flow) runContextCompaction(
 		},
 	)
 	if !updated {
+		outcome := contextCompactionOutcomeNoUpdate
 		if err != nil {
-			log.DebugfContext(
-				ctx,
-				"Pre-LLM context compaction skipped for agent %s: %v",
-				invocation.AgentName,
-				err,
-			)
+			outcome = contextCompactionOutcomeSummaryError
 		}
+		logResult(outcome, decisionRequest, decision.tokenCount)
 		return req
 	}
 
@@ -1750,13 +1842,14 @@ func (f *Flow) runContextCompaction(
 	}
 	finishLatencySpan(rebuildSpan, rebuildStarted, nil)
 	if rebuilt == nil {
-		log.DebugfContext(
-			ctx,
-			"Pre-LLM context compaction skipped for agent %s: safe rebuild unavailable",
-			invocation.AgentName,
+		logResult(
+			contextCompactionOutcomeRebuildUnavailable,
+			decisionRequest,
+			decision.tokenCount,
 		)
 		return req
 	}
+	usedRebuild = true
 	postDecisionRequest := requestWithCallLimitFinalizationMessage(
 		rebuilt,
 		rebuildPlan.callLimitFinalizationMessage,
@@ -1768,6 +1861,7 @@ func (f *Flow) runContextCompaction(
 		f.contextCompactionThresholdRatio,
 		rebuildPlan.contentProcessor.ContextCompactionConfig.TokenCounter,
 	)
+	postRequestTokens := postDecision.tokenCount
 	if postDecision.err == nil {
 		summaryview.Finalize(
 			invocation,
@@ -1781,23 +1875,23 @@ func (f *Flow) runContextCompaction(
 			invocation.AgentName,
 			postDecision.err,
 		)
+		postRequestTokens = -1
 	}
 
 	if err != nil {
-		log.WarnfContext(
-			ctx,
-			"Pre-LLM context compaction rebuilt request for agent %s after in-memory summary update; persistence failed: %v",
-			invocation.AgentName,
-			err,
+		logResult(
+			contextCompactionOutcomePersistenceError,
+			postDecisionRequest,
+			postRequestTokens,
 		)
 		return rebuilt
 	}
 
-	log.DebugfContext(
-		ctx,
-		"Pre-LLM context compaction rebuilt request for agent %s",
-		invocation.AgentName,
-	)
+	outcome := contextCompactionOutcomeSuccess
+	if postDecision.err != nil {
+		outcome = contextCompactionOutcomePostCountError
+	}
+	logResult(outcome, postDecisionRequest, postRequestTokens)
 	return rebuilt
 }
 
@@ -1826,11 +1920,7 @@ func (f *Flow) rebuildRequestForContextCompaction(
 			rebuilt,
 		)
 	}
-	rebuilt.Messages = toolcall.SanitizeMessagesWithTools(
-		ctx,
-		rebuilt.Messages,
-		rebuilt.Tools,
-	)
+	sanitizeRequestMessages(ctx, invocation, rebuilt)
 	return rebuilt
 }
 
@@ -2095,10 +2185,13 @@ func syncCompactContextDecision(
 		return decision
 	}
 
-	decision.threshold = contextCompactionThreshold(inv, ratio)
 	decision.contextWindow = contextCompactionWindow(inv)
+	decision.threshold, decision.thresholdBasis = contextCompactionThresholdForWindow(
+		decision.contextWindow,
+		ratio,
+	)
 	if counter == nil {
-		counter = model.NewSimpleTokenCounter()
+		counter = summarytoken.Get()
 	}
 	tokens, err := counter.CountTokensRange(ctx, req.Messages, 0, len(req.Messages))
 	decision.tokenCount = tokens
@@ -2133,14 +2226,25 @@ func contextCompactionWindow(inv *agent.Invocation) int {
 
 func contextCompactionThreshold(inv *agent.Invocation, ratio float64) int {
 	contextWindow := contextCompactionWindow(inv)
+	threshold, _ := contextCompactionThresholdForWindow(contextWindow, ratio)
+	return threshold
+}
+
+func contextCompactionThresholdForWindow(
+	contextWindow int,
+	ratio float64,
+) (int, string) {
 	threshold := int(float64(contextWindow) * normalizeContextCompactionThresholdRatio(ratio))
+	basis := contextCompactionThresholdBasisContextWindow
 	if threshold < contextCompactionMinTokens {
 		threshold = contextCompactionMinTokens
+		basis = contextCompactionThresholdBasisMinimumTokens
 	}
 	if threshold > contextWindow {
 		threshold = contextWindow
+		basis = contextCompactionThresholdBasisContextWindow
 	}
-	return threshold
+	return threshold, basis
 }
 
 // getFilteredTools returns the list of tools for this invocation after applying the filter.
@@ -2396,16 +2500,23 @@ func (f *Flow) callLLM(
 		latencyRequestAttrs(llmRequest)...,
 	)
 	var err error
-	defer func() {
+	finishSpanOnReturn := true
+	finishCallSpan := func(finishErr error) {
 		if started && callModel != nil {
 			span.SetAttributes(
 				attribute.String("llmflow.model", callModel.Info().Name),
 			)
 		}
-		finishLatencySpan(span, started, err)
+		finishLatencySpan(span, started, finishErr)
+	}
+	defer func() {
+		if finishSpanOnReturn {
+			finishCallSpan(err)
+		}
 	}()
 	if callModel == nil {
 		err = errors.New("no model available for LLM call")
+		reportSummaryInjection(ctx, invocation, llmRequest)
 		return ctx, nil, false, err
 	}
 	log.DebugfContext(
@@ -2417,6 +2528,7 @@ func (f *Flow) callLLM(
 	// configured (<= 0), this is a no-op and preserves existing behavior.
 	if err = invocation.IncLLMCallCount(); err != nil {
 		log.Errorf("LLM call limit exceeded for agent %s: %v", invocation.AgentName, err)
+		reportSummaryInjection(ctx, invocation, llmRequest)
 		return ctx, nil, false, err
 	}
 	llmLimitReached := calllimit.RecordLLMCall(
@@ -2437,15 +2549,25 @@ func (f *Flow) callLLM(
 	// Run before model callbacks if they exist.
 	ctx, customResp, err := f.runBeforeModelCallbacks(ctx, invocation, llmRequest)
 	if err != nil {
+		reportSummaryInjection(ctx, invocation, llmRequest)
 		return ctx, nil, false, err
 	}
 	if customResp != nil {
-		return ctx, func(yield func(*model.Response) bool) {
-			yield(customResp)
-		}, false, nil
+		// Keep the original callLLM return and span-on-return contract.
+		// The seq finalizer reports once on drain or early stop. An
+		// unused seq is never consumed, so it reports nothing.
+		return ctx, withResponseSeqFinalizer(
+			func(yield func(*model.Response) bool) {
+				yield(customResp)
+			},
+			func() {
+				reportSummaryInjection(ctx, invocation, llmRequest)
+			},
+		), false, nil
 	}
 	if llmRequest == nil || len(llmRequest.Messages) == 0 {
 		err = errors.New(errMsgNoLLMMessages)
+		reportSummaryInjection(ctx, invocation, llmRequest)
 		return ctx, nil, false, err
 	}
 	if invocation != nil && invocation.RunOptions.ExecutionTraceEnabled {
@@ -2473,11 +2595,80 @@ func (f *Flow) callLLM(
 			finalizationMessage,
 		),
 	)
+	ctx, tailoringObserver := imodelrequest.ObserveTokenTailoring(
+		ctx,
+		func(record imodelrequest.TokenTailoringRecord) {
+			summaryview.InvalidateBinding(invocation)
+			summaryfork.Invalidate(invocation)
+			if tokenTailoringCollapsedHistory(record) {
+				log.WarnfContext(
+					ctx,
+					"Model request token tailoring collapsed history: "+
+						"provider=%s, max_input_tokens=%d, messages=%d->%d",
+					record.Provider,
+					record.MaxInputTokens,
+					record.BeforeMessages,
+					record.AfterMessages,
+				)
+				return
+			}
+			log.DebugfContext(
+				ctx,
+				"Model request token tailoring applied: provider=%s, "+
+					"max_input_tokens=%d, messages=%d->%d",
+				record.Provider,
+				record.MaxInputTokens,
+				record.BeforeMessages,
+				record.AfterMessages,
+			)
+		},
+	)
 	seq, err := f.generateContentSeq(ctx, invocation, llmRequest, callModel)
 	if err != nil {
+		// generateContentSeq failed before returning a seq. Report once
+		// against the request as observed at that failure; do not also
+		// attach a seq finalizer.
+		reportSummaryInjection(ctx, invocation, llmRequest)
 		return ctx, nil, true, err
 	}
+	// Eager GenerateContent has already mutated llmRequest. A lazy
+	// IterModel may tailor or drop the selected summary only while the
+	// seq runs. Report once after the seq ends or is stopped early, and
+	// always attach that finalizer so a disabled call span cannot skip
+	// the record.
+	reportInjection := func() {
+		reportSummaryInjection(ctx, invocation, llmRequest)
+	}
+	if started {
+		finishSpanOnReturn = false
+		seq = withResponseSeqFinalizer(seq, func() {
+			reportInjection()
+			span.SetAttributes(
+				tokenTailoringAttrs(tailoringObserver.Snapshot())...,
+			)
+			finishCallSpan(nil)
+		})
+	} else {
+		seq = withResponseSeqFinalizer(seq, reportInjection)
+	}
 	return ctx, seq, true, nil
+}
+
+func tokenTailoringCollapsedHistory(
+	record imodelrequest.TokenTailoringRecord,
+) bool {
+	return record.BeforeMessages > 2 && record.AfterMessages <= 2
+}
+
+func withResponseSeqFinalizer(
+	seq model.Seq[*model.Response],
+	finalize func(),
+) model.Seq[*model.Response] {
+	var once sync.Once
+	return func(yield func(*model.Response) bool) {
+		defer once.Do(finalize)
+		seq(yield)
+	}
 }
 
 type callLimitFinalizationMessage struct {
@@ -2603,7 +2794,7 @@ func finalizeSummaryView(
 		return
 	}
 	if counter == nil {
-		counter = model.NewSimpleTokenCounter()
+		counter = summarytoken.Get()
 	}
 	tokens, err := counter.CountTokensRange(
 		ctx,
@@ -2616,6 +2807,100 @@ func finalizeSummaryView(
 		return
 	}
 	summaryview.Finalize(invocation, req, tokens)
+}
+
+// reportSummaryInjection reports whether the session summary selected while
+// building this request is still present in the same model.Request after the
+// response sequence has been observed. Eager GenerateContent mutates that
+// request before returning a seq; a lazy IterModel may mutate it only while
+// the seq runs. Built-in providers, including the OpenAI adapter, mutate the
+// request in place during token tailoring, so the record then reflects the
+// tailored framework request. A custom Model may copy the request, in which
+// case the record does not claim to describe the payload that Model sent.
+// Requests that do not use session summaries report nothing.
+func reportSummaryInjection(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	req *model.Request,
+) {
+	if invocation == nil || req == nil {
+		return
+	}
+	selection, ok := summaryinject.FromInvocation(invocation)
+	if !ok {
+		return
+	}
+	blockPresent := selection.BlockPresent(req.Messages)
+	outcome := summaryInjectionOutcome(selection, blockPresent)
+	filterKey, filterKeyTruncated :=
+		summarydiag.FormatFilterKey(invocation.GetEventFilterKey())
+	agentName, agentTruncated :=
+		summarydiag.FormatAgentName(invocation.AgentName)
+	format := "Session summary injection result: schema_version=%d, " +
+		"outcome=%s, agent=%q, agent_truncated=%t, filter_key=%q, " +
+		"filter_key_truncated=%t, lookup_strategy=%s, lookup_result=%s, " +
+		"selected=%t, block_text_present=%t, boundary_present=%t, " +
+		"stored_summaries=%d, matching_candidates=%d, " +
+		"full_session_summary=%t, session_events=%d, history_messages=%d, " +
+		"request_messages=%d"
+	args := []any{
+		summarydiag.SchemaVersion,
+		outcome,
+		agentName,
+		agentTruncated,
+		filterKey,
+		filterKeyTruncated,
+		selection.LookupStrategy,
+		selection.LookupResult,
+		selection.Selected,
+		blockPresent,
+		selection.BoundaryPresent,
+		selection.StoredSummaries,
+		selection.MatchingCandidates,
+		selection.FullSessionPresent,
+		selection.SessionEvents,
+		selection.HistoryMessages,
+		len(req.Messages),
+	}
+	switch outcome {
+	case summaryInjectionOutcomeBlockTextMissing:
+		// A selected summary whose recorded block text is missing from every
+		// framework request message is the only injection defect that Warns.
+		// This is a substring observation of the same model.Request after
+		// the response sequence has been observed; it does not claim what
+		// a provider sent, or that the original injection slot is intact.
+		log.WarnfContext(ctx, format, args...)
+	default:
+		// Requests that found no in-scope summary, including a branch miss
+		// next to an unused full-session summary, are routine.
+		log.DebugfContext(ctx, format, args...)
+	}
+}
+
+// summaryInjectionOutcome classifies one request's summary injection. A
+// selected summary whose recorded block text is missing from every message
+// Content in the same framework model.Request is reported as
+// block_text_missing. That observation does not describe a provider's
+// final payload or prove the original injection slot. A scope mismatch
+// names the unused full-session summary; it does not mean the scoped
+// history was dropped from this request.
+func summaryInjectionOutcome(
+	selection summaryinject.Selection,
+	blockPresent bool,
+) string {
+	if selection.Selected {
+		if blockPresent {
+			return summaryInjectionOutcomeBlockTextPresent
+		}
+		return summaryInjectionOutcomeBlockTextMissing
+	}
+	if selection.ScopeMismatch() {
+		return summaryInjectionOutcomeScopeMismatch
+	}
+	if selection.StoredSummaries > 0 {
+		return summaryInjectionOutcomeLookupMiss
+	}
+	return summaryInjectionOutcomeNotSelected
 }
 
 func (f *Flow) summaryViewTokenCounter() model.TokenCounter {

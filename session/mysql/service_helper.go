@@ -10,6 +10,7 @@
 package mysql
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -539,12 +540,15 @@ func (s *Service) deleteSessionState(ctx context.Context, key session.Key) error
 				return err
 			}
 
-			// Soft delete session summaries
-			_, err = tx.ExecContext(ctx,
-				fmt.Sprintf(`UPDATE %s SET deleted_at = ?
-				 WHERE app_name = ? AND user_id = ? AND session_id = ? AND deleted_at IS NULL`, s.tableSessionSummaries),
-				now, key.AppName, key.UserID, key.SessionID)
-			if err != nil {
+			// Soft delete session summaries. Legacy schemas may contain duplicate
+			// active rows that require the compatibility fallback.
+			if err = s.softDeleteSummaries(
+				ctx,
+				tx,
+				"app_name = ? AND user_id = ? AND session_id = ? AND deleted_at IS NULL",
+				[]any{key.AppName, key.UserID, key.SessionID},
+				now,
+			); err != nil {
 				return err
 			}
 
@@ -657,7 +661,7 @@ func (s *Service) getEventsList(
 
 	// TDSQL proxy cannot extract shardkey from tuple comparison;
 	// add explicit user_id for shard routing. Harmless on MySQL.
-	query := fmt.Sprintf(`SELECT app_name, user_id, session_id, event, created_at FROM %s
+	query := fmt.Sprintf(`SELECT app_name, user_id, session_id, event, created_at, id FROM %s
 		WHERE (app_name, user_id, session_id) IN (%s)
 		AND user_id = ?
 		AND deleted_at IS NULL`,
@@ -673,6 +677,7 @@ func (s *Service) getEventsList(
 	type eventWithOrder struct {
 		evt       event.Event
 		createdAt time.Time
+		id        int64
 	}
 	eventsMap := make(map[string][]eventWithOrder)
 
@@ -680,7 +685,8 @@ func (s *Service) getEventsList(
 		var appName, userID, sessionID string
 		var eventBytes []byte
 		var eventCreatedAt time.Time
-		if err := rows.Scan(&appName, &userID, &sessionID, &eventBytes, &eventCreatedAt); err != nil {
+		var eventID int64
+		if err := rows.Scan(&appName, &userID, &sessionID, &eventBytes, &eventCreatedAt, &eventID); err != nil {
 			return err
 		}
 		keyStr := fmt.Sprintf("%s:%s:%s", appName, userID, sessionID)
@@ -695,7 +701,7 @@ func (s *Service) getEventsList(
 		if err := json.Unmarshal(eventBytes, &evt); err != nil {
 			return fmt.Errorf("unmarshal event failed: %w", err)
 		}
-		eventsMap[keyStr] = append(eventsMap[keyStr], eventWithOrder{evt: evt, createdAt: eventCreatedAt})
+		eventsMap[keyStr] = append(eventsMap[keyStr], eventWithOrder{evt: evt, createdAt: eventCreatedAt, id: eventID})
 		return nil
 	}, query, args...)
 
@@ -708,7 +714,10 @@ func (s *Service) getEventsList(
 		keyStr := fmt.Sprintf("%s:%s:%s", key.AppName, key.UserID, key.SessionID)
 		items := eventsMap[keyStr]
 		slices.SortFunc(items, func(a, b eventWithOrder) int {
-			return a.createdAt.Compare(b.createdAt)
+			if c := a.createdAt.Compare(b.createdAt); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.id, b.id)
 		})
 		events := make([]event.Event, len(items))
 		for j, item := range items {
@@ -728,6 +737,10 @@ type eventRef struct {
 	id             int64
 	createdAt      time.Time
 	eventTimestamp time.Time
+	// timestampMissing marks a row removed between ID and timestamp reads.
+	// Retain its ordering metadata so a partially deleted batch still advances
+	// the cursor without prematurely ending the search for older events.
+	timestampMissing bool
 }
 
 // getLimitedSessionEvents loads a bounded event window for GetSession while
@@ -849,7 +862,7 @@ func (s *Service) getRecentEventRefs(
 		WHERE app_name = ? AND user_id = ? AND session_id = ?
 		AND created_at >= ?
 		AND deleted_at IS NULL
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 		LIMIT ?`,
 		s.tableSessionEvents)
 
@@ -887,7 +900,7 @@ func (s *Service) getRecentEventRefsAfterEventTime(
 			break
 		}
 		for _, ref := range batch {
-			if ref.eventTimestamp.Before(eventAfterTime) {
+			if ref.timestampMissing || ref.eventTimestamp.Before(eventAfterTime) {
 				continue
 			}
 			refs = append(refs, ref)
@@ -946,8 +959,15 @@ func (s *Service) getEventsByRefs(
 		return nil, fmt.Errorf("batch get events failed: %w", err)
 	}
 
+	// Tie-break on id: created_at alone is not a total order. A tool call and
+	// its result are written milliseconds apart and collide whenever the column
+	// resolution is coarser than the write interval, which would otherwise let
+	// the descending scan order survive into conversation order.
 	slices.SortFunc(refs, func(a, b eventRef) int {
-		return a.createdAt.Compare(b.createdAt)
+		if c := a.createdAt.Compare(b.createdAt); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.id, b.id)
 	})
 	events := make([]event.Event, 0, len(refs))
 	for _, ref := range refs {
@@ -1025,13 +1045,15 @@ func (s *Service) getPreviousEventRefs(
 		s.tableSessionEvents)
 	args := []any{key.AppName, key.UserID, key.SessionID, sessionCreatedAt}
 	if before != nil {
-		// Keyset cursor: rows sharing the exact same microsecond created_at as
-		// the cursor boundary may be skipped. TIMESTAMP(6) makes this rare in
-		// practice and we accept the tradeoff to avoid filesort on the index.
-		query += ` AND created_at < ?`
-		args = append(args, before.createdAt)
+		// Composite keyset cursor on (created_at, id). Comparing created_at
+		// alone drops every remaining row that shares the boundary timestamp,
+		// which is common when the column resolution is coarser than the write
+		// interval. Written as an expanded OR rather than a tuple comparison
+		// because the TDSQL proxy cannot extract the shardkey from tuples.
+		query += ` AND (created_at < ? OR (created_at = ? AND id < ?))`
+		args = append(args, before.createdAt, before.createdAt, before.id)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, userAnchorSearchBatchSize)
 
 	refs := make([]eventRef, 0, userAnchorSearchBatchSize)
@@ -1056,8 +1078,11 @@ func (s *Service) getEventRefsWithTimestamp(
 	before *eventRef,
 	limit int,
 ) ([]eventRef, error) {
+	// Keep JSON out of the ordered query. Even a JSON_EXTRACT projection can
+	// make MySQL carry the full document in filesort records and exhaust the
+	// sort buffer for large events.
 	query := fmt.Sprintf(
-		`SELECT id, created_at, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM %s
+		`SELECT id, created_at FROM %s
 		WHERE app_name = ? AND user_id = ? AND session_id = ?
 		AND created_at >= ?
 		AND deleted_at IS NULL`,
@@ -1065,22 +1090,57 @@ func (s *Service) getEventRefsWithTimestamp(
 	)
 	args := []any{key.AppName, key.UserID, key.SessionID, afterTime}
 	if before != nil {
-		// Keyset cursor: rows sharing the exact same microsecond created_at as
-		// the cursor boundary may be skipped. TIMESTAMP(6) makes this rare in
-		// practice and we accept the tradeoff to avoid filesort on the index.
-		query += ` AND created_at < ?`
-		args = append(args, before.createdAt)
+		// Composite keyset cursor on (created_at, id); see getPreviousEventRefs
+		// for why this is an expanded OR instead of a tuple comparison.
+		query += ` AND (created_at < ? OR (created_at = ? AND id < ?))`
+		args = append(args, before.createdAt, before.createdAt, before.id)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
 
 	refs := make([]eventRef, 0, limit)
 	err := s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
 		var ref eventRef
-		var eventTimestamp sql.NullString
-		if err := rows.Scan(&ref.id, &ref.createdAt, &eventTimestamp); err != nil {
+		if err := rows.Scan(&ref.id, &ref.createdAt); err != nil {
 			return err
 		}
+		ref.timestampMissing = true
+		refs = append(refs, ref)
+		return nil
+	}, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch get events failed: %w", err)
+	}
+	if len(refs) == 0 {
+		return refs, nil
+	}
+
+	placeholders := make([]string, len(refs))
+	args = make([]any, len(refs), len(refs)+1)
+	refIndexes := make(map[int64]int, len(refs))
+	for i, ref := range refs {
+		placeholders[i] = "?"
+		args[i] = ref.id
+		refIndexes[ref.id] = i
+	}
+	// TDSQL PK is (id, user_id); retain user_id for shard routing. This query
+	// intentionally has no ORDER BY: fill timestamps by ID in the first
+	// query's order, without sorting the referenced JSON payloads.
+	query = fmt.Sprintf(`SELECT id, JSON_UNQUOTE(JSON_EXTRACT(event, '$.timestamp')) FROM %s
+		WHERE id IN (%s) AND user_id = ? AND deleted_at IS NULL`,
+		s.tableSessionEvents, strings.Join(placeholders, ","))
+	args = append(args, key.UserID)
+	err = s.mysqlClient.Query(ctx, func(rows *sql.Rows) error {
+		var id int64
+		var eventTimestamp sql.NullString
+		if err := rows.Scan(&id, &eventTimestamp); err != nil {
+			return err
+		}
+		index, ok := refIndexes[id]
+		if !ok {
+			return nil
+		}
+		ref := &refs[index]
 		ref.eventTimestamp = ref.createdAt
 		if eventTimestamp.Valid && eventTimestamp.String != "" {
 			parsed, err := time.Parse(time.RFC3339Nano, eventTimestamp.String)
@@ -1089,7 +1149,7 @@ func (s *Service) getEventRefsWithTimestamp(
 			}
 			ref.eventTimestamp = parsed
 		}
-		refs = append(refs, ref)
+		ref.timestampMissing = false
 		return nil
 	}, query, args...)
 	if err != nil {
@@ -1104,7 +1164,7 @@ func filterRefsByEventTimestamp(refs []eventRef, afterTime time.Time) []eventRef
 	}
 	filtered := make([]eventRef, 0, len(refs))
 	for _, ref := range refs {
-		if ref.eventTimestamp.Before(afterTime) {
+		if ref.timestampMissing || ref.eventTimestamp.Before(afterTime) {
 			continue
 		}
 		filtered = append(filtered, ref)
@@ -1112,11 +1172,16 @@ func filterRefsByEventTimestamp(refs []eventRef, afterTime time.Time) []eventRef
 	return filtered
 }
 
-// oldestEventRef returns the earliest ref in the current bounded event window.
+// oldestEventRef returns the earliest ref in the current bounded event window,
+// ordered by the (created_at, id) composite key. Callers use the result as an
+// exclusive keyset cursor, so ties must resolve to the smallest id: comparing
+// created_at alone would leave the lower ids of a boundary timestamp behind the
+// cursor and replay them in the next batch.
 func oldestEventRef(refs []eventRef) eventRef {
 	oldest := refs[0]
 	for _, ref := range refs[1:] {
-		if ref.createdAt.Before(oldest.createdAt) {
+		c := ref.createdAt.Compare(oldest.createdAt)
+		if c < 0 || (c == 0 && ref.id < oldest.id) {
 			oldest = ref
 		}
 	}
@@ -1180,7 +1245,7 @@ func (s *Service) getPagedEvents(
 		WHERE app_name = ? AND user_id = ? AND session_id = ?
 		AND created_at >= ?
 		AND deleted_at IS NULL
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 		LIMIT ? OFFSET ?`,
 		s.tableSessionEvents)
 
@@ -1262,7 +1327,7 @@ func (s *Service) getTrackEventsByTrackLists(
 				args = append(args, afterTime)
 			}
 			query += `
-					ORDER BY created_at DESC`
+					ORDER BY created_at DESC, id DESC`
 			if limit > 0 {
 				query += `
 					LIMIT ?`
@@ -1334,11 +1399,14 @@ func (s *Service) getSummariesList(
 	// add explicit user_id for shard routing. Harmless on MySQL.
 	args = append(args, sessionKeys[0].UserID, time.Now())
 
+	// Sort oldest-first so later map assignments deterministically retain the
+	// newest active copy when a legacy schema contains duplicates.
 	query := fmt.Sprintf(`SELECT app_name, user_id, session_id, filter_key, summary, updated_at FROM %s
 		WHERE (app_name, user_id, session_id) IN (%s)
 		AND user_id = ?
 		AND (expires_at IS NULL OR expires_at > ?)
-		AND deleted_at IS NULL`,
+		AND deleted_at IS NULL
+		ORDER BY updated_at ASC, id ASC`,
 		s.tableSessionSummaries, strings.Join(placeholders, ","))
 
 	// Build a map of session key to created_at for filtering
