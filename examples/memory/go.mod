@@ -24,7 +24,7 @@ require (
 	gorm.io/driver/postgres v1.5.7
 	gorm.io/driver/sqlite v1.5.7
 	gorm.io/gorm v1.30.0
-	trpc.group/trpc-go/trpc-agent-go v1.10.1-0.20260708123258-eba6f54c8869
+	trpc.group/trpc-go/trpc-agent-go v1.12.0
 	trpc.group/trpc-go/trpc-agent-go/memory/gorm v0.0.0
 	trpc.group/trpc-go/trpc-agent-go/memory/mysql v1.1.1
 	trpc.group/trpc-go/trpc-agent-go/memory/mysqlvec v1.1.1

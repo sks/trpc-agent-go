@@ -70,6 +70,10 @@ type Schema struct {
 	// addresses, and UUIDs. JSON Schema 2020-12 treats it as an annotation by
 	// default.
 	Format string `json:"format,omitempty"`
+	// AnyOf requires a value to match at least one branch. Other fields on
+	// this schema still apply; leave Type empty to allow different types.
+	// A nil or empty slice omits the anyOf constraint.
+	AnyOf []*Schema `json:"anyOf,omitempty"`
 	// Pattern restricts string values to a regular expression.
 	Pattern string `json:"pattern,omitempty"`
 	// MinLength and MaxLength constrain the number of Unicode code points in a

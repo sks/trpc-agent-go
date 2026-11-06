@@ -7,6 +7,8 @@
 //
 //
 
+// Package main demonstrates multi-turn chat through the OpenAI Responses
+// adapter, LLMAgent, and an in-memory Runner session.
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -22,91 +25,91 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
-	openairesponses "trpc.group/trpc-go/trpc-agent-go/model/openai/responses"
+	"trpc.group/trpc-go/trpc-agent-go/model/openai/sdkv3/responses"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 func main() {
-	modelName := flag.String("model", envOr("OPENAI_MODEL", "gpt-5"), "Model name")
-	apiKey := flag.String("api-key", os.Getenv("OPENAI_API_KEY"), "OpenAI API key")
-	baseURL := flag.String("base-url", os.Getenv("OPENAI_BASE_URL"), "OpenAI base URL")
-	streaming := flag.Bool("streaming", true, "Enable streaming")
+	modelName := flag.String("model", "gpt-5", "OpenAI model name")
+	streaming := flag.Bool("streaming", true, "Enable streaming responses")
 	flag.Parse()
 
-	fmt.Printf("🚀 OpenAI Responses chat\nModel: %s  Streaming: %t\n", *modelName, *streaming)
-	opts := []openairesponses.Option{
-		openairesponses.WithAPIKey(*apiKey),
-		openairesponses.WithStore(false),
-	}
-	if *baseURL != "" {
-		opts = append(opts, openairesponses.WithBaseURL(*baseURL))
-	}
+	// The SDK reads OPENAI_API_KEY and OPENAI_BASE_URL.
+	chatModel := responses.New(*modelName)
+	chatAgent := llmagent.New(
+		"responses-chat",
+		llmagent.WithModel(chatModel),
+		llmagent.WithDescription("A concise chat assistant."),
+		llmagent.WithInstruction("Answer the user's questions clearly and concisely."),
+		llmagent.WithGenerationConfig(model.GenerationConfig{Stream: *streaming}),
+	)
+	// The in-memory session lives only until this process exits.
+	sessions := sessioninmemory.NewSessionService()
+	defer sessions.Close()
 	r := runner.NewRunner(
-		"openairesponses-chat",
-		llmagent.New(
-			"chat-assistant",
-			llmagent.WithModel(openairesponses.New(*modelName, opts...)),
-			llmagent.WithDescription("A helpful assistant."),
-			llmagent.WithInstruction("Stay concise."),
-			llmagent.WithGenerationConfig(model.GenerationConfig{
-				MaxTokens: intPtr(2000),
-				Stream:    *streaming,
-			}),
-		),
-		runner.WithSessionService(sessioninmemory.NewSessionService()),
+		"responses-chat-example",
+		chatAgent,
+		runner.WithSessionService(sessions),
 	)
 	defer r.Close()
 
-	sessionID := fmt.Sprintf("chat-%d", time.Now().Unix())
+	sessionID := fmt.Sprintf("chat-%d", time.Now().UnixNano())
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println("Type '/exit' to end the conversation")
+	fmt.Println("OpenAI Responses chat. Type /exit to quit.")
 	for {
-		fmt.Print("👤 You: ")
+		fmt.Print("You: ")
 		if !scanner.Scan() {
 			break
 		}
 		text := strings.TrimSpace(scanner.Text())
-		if text == "" {
-			continue
-		}
 		if text == "/exit" {
 			return
+		}
+		if text == "" {
+			continue
 		}
 		ch, err := r.Run(context.Background(), "demo-user", sessionID, model.NewUserMessage(text))
 		if err != nil {
 			log.Printf("run: %v", err)
 			continue
 		}
-		printEvents(ch, *streaming)
+		printEvents(os.Stdout, ch, *streaming)
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("read input: %v", err)
 	}
 }
 
-func printEvents(ch <-chan *event.Event, streaming bool) {
-	fmt.Print("🤖 Assistant: ")
+func printEvents(w io.Writer, ch <-chan *event.Event, streaming bool) {
+	fmt.Fprint(w, "Assistant: ")
+	var streamedText strings.Builder
 	for evt := range ch {
-		if evt.Response == nil || len(evt.Response.Choices) == 0 {
-			if evt.IsFinalResponse() {
-				fmt.Println()
-			}
+		if evt == nil || evt.Response == nil {
 			continue
 		}
-		if streaming {
-			fmt.Print(evt.Response.Choices[0].Delta.Content)
-		} else if evt.Response.Choices[0].Message.Content != "" {
-			fmt.Print(evt.Response.Choices[0].Message.Content)
+		if evt.Error != nil {
+			fmt.Fprintf(w, "\nError: %s\n", evt.Error.Message)
+			streamedText.Reset()
+			continue
+		}
+		if len(evt.Response.Choices) == 0 {
+			continue
+		}
+		choice := evt.Response.Choices[0]
+		if streaming && evt.IsPartial {
+			fmt.Fprint(w, choice.Delta.Content)
+			streamedText.WriteString(choice.Delta.Content)
+		} else if choice.Message.Role == model.RoleAssistant {
+			if streaming && streamedText.Len() > 0 && streamedText.String() != choice.Message.Content {
+				fmt.Fprintf(w, "\nAssistant (completed): %s", choice.Message.Content)
+			} else if !streaming || streamedText.Len() == 0 {
+				fmt.Fprint(w, choice.Message.Content)
+			}
+			streamedText.Reset()
 		}
 		if evt.IsFinalResponse() {
-			fmt.Println()
+			fmt.Fprintln(w)
 		}
 	}
 }
-
-func envOr(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func intPtr(i int) *int { return &i }
