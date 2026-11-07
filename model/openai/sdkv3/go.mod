@@ -5,13 +5,13 @@ go 1.25.0
 replace trpc.group/trpc-go/trpc-agent-go => ../../..
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/openai/openai-go/v3 v3.74.0
 	github.com/stretchr/testify v1.11.1
 	trpc.group/trpc-go/trpc-agent-go v1.13.0-beta.1
 )
 
 require (
-	github.com/coder/websocket v1.8.15 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect

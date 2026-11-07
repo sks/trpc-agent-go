@@ -8,10 +8,6 @@ This independent module shows how to use the OpenAI Responses adapter with
 - `chat` is a multi-turn conversation without tools.
 - `tools` registers a local calculator and keeps one in-memory session across
   user messages.
-- `validate-store-false` exercises the fork's nested
-  `model/openai/responses` adapter (WebSocket / mid-turn steer capable) for the
-  `store=false` reasoning replay path. Prefer `chat` and `tools` for the
-  published `model/openai/sdkv3/responses` module.
 
 Every request sends the full client-managed conversation. The adapter defaults
 to `store=false`, and both programs set that explicitly. In ordinary Runner

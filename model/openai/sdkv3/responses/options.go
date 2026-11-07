@@ -23,6 +23,8 @@ type options struct {
 	apiKey            string
 	baseURL           string
 	store             bool
+	useWebSocket      bool
+	steerCallback     SteerSessionCallback
 	channelBufferSize int
 	httpClientOptions []model.HTTPClientOption
 	openaiOptions     []option.RequestOption
@@ -57,6 +59,20 @@ func WithStore(store bool) Option {
 	return func(o *options) {
 		o.store = store
 	}
+}
+
+// WithWebSocket enables the Responses WebSocket transport for streaming calls.
+// It defaults to false; non-streaming calls still use HTTP.
+func WithWebSocket(enable bool) Option {
+	return func(o *options) { o.useWebSocket = enable }
+}
+
+// WithSteerSessionCallback registers a callback invoked with a live MidTurnSession
+// when a WebSocket streaming call connects, and with nil when that call ends.
+// The callback must return promptly and must not block waiting for a response.
+// It has no effect unless WithWebSocket(true) is set.
+func WithSteerSessionCallback(cb SteerSessionCallback) Option {
+	return func(o *options) { o.steerCallback = cb }
 }
 
 // WithChannelBufferSize sets the GenerateContent channel buffer. Non-positive
