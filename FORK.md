@@ -27,26 +27,28 @@ Everything else: prefer **upstream** unless a Genie pin or test proves otherwise
 
 ## OpenAI Responses (AIOS-935)
 
-Stock OpenAI reasoning + function tools should use the nested module
-`model/openai/responses` (upstream [PR #2483](https://github.com/trpc-group/trpc-agent-go/pull/2483)),
+Stock OpenAI reasoning + function tools should use upstream's nested
+`model/openai/sdkv3/responses` module (merged [PR #2687](https://github.com/trpc-group/trpc-agent-go/pull/2687)),
 not Chat Completions `model/openai`. Chat Completions stays the default for
 Azure and custom OpenAI-compatible hosts.
 
 ```go
-import openairesponses "trpc.group/trpc-go/trpc-agent-go/model/openai/responses"
+import openairesponses "trpc.group/trpc-go/trpc-agent-go/model/openai/sdkv3/responses"
 
 m := openairesponses.New(modelName,
     openairesponses.WithAPIKey(apiKey),
     openairesponses.WithBaseURL(baseURL), // SDK appends "responses"
-    openairesponses.WithStore(false),     // stateless; no plaintext CoT store
+    openairesponses.WithStore(false),     // client-managed history
 )
 ```
 
-With `store=false`, the adapter requests `include=["reasoning.encrypted_content"]`,
-stores the blob on `Message.ReasoningSignature`, and replays it on later turns
-**without** inventing `rs_replay_*` ids. Plaintext `ReasoningContent` alone is
-never sent as a reasoning input item (that is what caused dogfood 404s).
-Function-call / tool-output items still convert so multi-step tool loops work.
+With `store=false`, this adapter requests encrypted reasoning and stores the
+complete ordered native output in `Message.ProviderData`, which must survive
+session persistence for multi-turn replay. `ReasoningSignature` from the old
+fork-only adapter is not interchangeable with `ProviderData`: existing
+Responses sessions need a new session boundary or an explicit migration.
+The fork retains opt-in WebSocket mid-turn steering for official-host models;
+regular Responses calls use upstream's HTTP/SSE behavior.
 
 Try locally:
 
@@ -57,7 +59,7 @@ go run ./chat -streaming=true
 go run ./tools -streaming=true
 ```
 
-Nested module tests: `cd model/openai/responses && go test ./...`
+Nested module tests: `cd model/openai/sdkv3 && go test ./...`
 
 Genie should construct this type for qualified stock OpenAI models and keep
 mapping `reasoning_profile` → native `ReasoningEffort` on `GenerationConfig`.

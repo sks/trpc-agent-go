@@ -29,6 +29,8 @@ type Model struct {
 	client            openai.Client
 	name              string
 	store             bool
+	useWebSocket      bool
+	steerCallback     SteerSessionCallback
 	channelBufferSize int
 	extraFields       map[string]any
 }
@@ -55,6 +57,8 @@ func New(name string, opts ...Option) *Model {
 		client:            openai.NewClient(clientOpts...),
 		name:              name,
 		store:             o.store,
+		useWebSocket:      o.useWebSocket,
+		steerCallback:     o.steerCallback,
 		channelBufferSize: o.channelBufferSize,
 		extraFields:       o.extraFields,
 	}
@@ -130,7 +134,11 @@ func (m *Model) GenerateContent(
 			}
 		}
 		if request.Stream {
-			m.handleStreaming(ctx, params, reqOpts, emit)
+			if m.useWebSocket {
+				m.handleWebSocketStreaming(ctx, params, reqOpts, emit)
+			} else {
+				m.handleStreaming(ctx, params, reqOpts, emit)
+			}
 			return
 		}
 		m.handleNonStreaming(ctx, params, reqOpts, emit)

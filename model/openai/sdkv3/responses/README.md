@@ -49,6 +49,24 @@ Runnable programs and the user-level walkthrough:
 The sections below are the detailed support, history, compatibility, and
 recovery contract.
 
+### Fork-only WebSocket steering
+
+`WithWebSocket(true)` opts streaming requests into the Responses WebSocket API.
+`WithSteerSessionCallback` receives a `MidTurnSession` while that request is
+active and `nil` on teardown. Once `ResponseID()` is nonempty, hosts can call
+`Steer(ctx, input)` to send `response.steer`; the final response commits only
+the validated successor's native `ProviderData`. Each request opens its own
+connection and sends complete client-managed history. A connection failure
+before `response.create` falls back to HTTP/SSE; errors after creation do not
+retry to avoid duplicate requests. Non-streaming requests remain HTTP.
+
+Server-side tool/approval continuation after `response.steer.pending` is not
+supported: the adapter returns an error rather than committing a partial tool
+call. Callers that require sticky WebSocket continuation should not switch
+from the old fork adapter without addressing this contract. Histories from the
+old adapter used `ReasoningSignature` instead of `ProviderData`; start a new
+session or migrate stored events before switching adapters.
+
 ## Supported contract
 
 - Full client-managed history on every request; `store=false` by default.
