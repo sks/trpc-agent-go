@@ -151,6 +151,21 @@ func (m *Model) handleWebSocketStreaming(
 			return
 		}
 		switch event.Type {
+		case eventError:
+			// WebSocket error events nest the diagnostic under error; the HTTP
+			// stream event union has top-level message/code fields instead.
+			// Preserve the provider's reason rather than reporting a generic
+			// "responses stream did not complete" error.
+			wsError := event.AsResponsesServerEventResponseWsError().Error
+			message := wsError.Message
+			if message == "" {
+				message = "responses websocket error"
+			}
+			result := apiErrorResponse(errors.New(message))
+			result.Error.Code = strPtr(wsError.Code)
+			result.Error.Param = strPtr(wsError.Param)
+			emit(result)
+			return
 		case eventResponseSteerAccepted:
 			steerAccepted = true
 			continue

@@ -150,6 +150,38 @@ func TestWebSocketSteerCommitsOnlySuccessorNativeOutput(t *testing.T) {
 	require.NotContains(t, capturedCreate, "previous_response_id")
 }
 
+func TestWebSocketErrorPreservesProviderMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if _, _, err := conn.Read(ctx); err != nil {
+			return
+		}
+		_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"unsupported_parameter","param":"tools","message":"This model does not support tools on WebSocket"}}`))
+	}))
+	defer srv.Close()
+
+	m := New("gpt-6-astra", WithAPIKey("test"), WithBaseURL(srv.URL), WithWebSocket(true))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := m.GenerateContent(ctx, &model.Request{
+		GenerationConfig: model.GenerationConfig{Stream: true},
+		Messages:         []model.Message{model.NewUserMessage("hi")},
+	})
+	require.NoError(t, err)
+	got := collect(t, ch)
+	require.Len(t, got, 1)
+	require.Empty(t, got[0].Choices)
+	require.Equal(t, "This model does not support tools on WebSocket", got[0].Error.Message)
+	require.Equal(t, "unsupported_parameter", *got[0].Error.Code)
+	require.Equal(t, "tools", *got[0].Error.Param)
+}
+
 func TestWebSocketSteerPendingCannotCommitToolCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
