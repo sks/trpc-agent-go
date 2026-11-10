@@ -4445,30 +4445,6 @@ func TestFlow_generateContentSeq_EmptyMessages(t *testing.T) {
 	require.Nil(t, seq)
 }
 
-func TestFlow_callLLM_EmptyMessages(t *testing.T) {
-	f := New(nil, nil, Options{})
-	inv := agent.NewInvocation(
-		agent.WithInvocationModel(&mockModel{}),
-	)
-
-	_, ch, err := f.callLLM(context.Background(), inv, &model.Request{}, inv.Model)
-	require.Error(t, err)
-	require.EqualError(t, err, errMsgNoLLMMessages)
-	require.Nil(t, ch)
-}
-
-func TestFlow_generateContentSeq_EmptyMessages(t *testing.T) {
-	f := New(nil, nil, Options{})
-	inv := agent.NewInvocation(
-		agent.WithInvocationModel(&mockModel{}),
-	)
-
-	seq, err := f.generateContentSeq(context.Background(), inv, &model.Request{}, inv.Model)
-	require.Error(t, err)
-	require.EqualError(t, err, errMsgNoLLMMessages)
-	require.Nil(t, seq)
-}
-
 func TestFlow_callLLM_ModelError(t *testing.T) {
 	f := New(nil, nil, Options{})
 	inv := agent.NewInvocation(
