@@ -78,7 +78,7 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 		"default": 1,
 		"enum": ["root"],
 		"items": {"type": ["null", "string"]},
-		"anyOf": [{"type": "integer", "pattern": "^ignored$"}],
+		"anyOf": [{"type": "integer", "pattern": "^[0-9]+$"}],
 		"required": ["anchor"],
 		"properties": {
 			"anchor": {"type": "string"},
@@ -93,7 +93,7 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 				"type": ["array", "null"],
 				"items": {
 					"type": ["object", "null"],
-					"default": "lost-on-items",
+					"default": "kept-on-items",
 					"properties": {"count": {"type": ["null", "integer"]}}
 				}
 			},
@@ -103,12 +103,13 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 			"Value": {
 				"type": ["null", "array"],
 				"items": {"type": ["null", "string"]},
-				"default": "lost",
+				"default": "kept",
 				"additionalProperties": false
 			}
 		}
 	}`, `{
 		"type": "object",
+		"anyOf": [{"type": "integer", "pattern": "^[0-9]+$"}],
 		"required": ["anchor"],
 		"properties": {
 			"anchor": {"type": "string"},
@@ -134,12 +135,24 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 					"anyOf": [{"type": "object"}, {"type": "null"}],
 					"properties": {
 						"count": {"anyOf": [{"type": "null"}, {"type": "integer"}]}
-					}
+					},
+					"default": "kept-on-items"
 				}
 			},
 			"title": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
 		},
-		"$defs": {"Value": {"anyOf": [{"type": "null"}, {"type": "array"}]}}
+		"items": {"anyOf": [{"type": "null"}, {"type": "string"}]},
+		"additionalProperties": false,
+		"default": 1,
+		"enum": ["root"],
+		"$defs": {
+			"Value": {
+				"anyOf": [{"type": "null"}, {"type": "array"}],
+				"items": {"anyOf": [{"type": "null"}, {"type": "string"}]},
+				"additionalProperties": false,
+				"default": "kept"
+			}
+		}
 	}`)
 }
 
@@ -163,7 +176,7 @@ func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
 				"pattern": "^root$",
 				"default": 1,
 				"enum": ["a"],
-				"items": {"type": "string", "default": "lost"},
+				"items": {"type": "string", "default": "kept"},
 				"additionalProperties": false,
 				"anyOf": [{"type": "string", "pattern": "^[a-z]+$"}, {"type": "null"}],
 				"required": ["name", "count"],
@@ -206,7 +219,7 @@ func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
 						"items": {
 							"type": "string",
 							"description": "tag",
-							"default": "lost-on-items",
+							"default": "kept-on-items",
 							"enum": ["a"],
 							"items": {"type": "number"},
 							"additionalProperties": false,
@@ -220,6 +233,7 @@ func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
 			want: `{
 				"type": "object",
 				"description": "root",
+				"anyOf": [{"type": "string", "pattern": "^[a-z]+$"}, {"type": "null"}],
 				"pattern": "^root$",
 				"required": ["name", "count"],
 				"properties": {
@@ -233,6 +247,7 @@ func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
 					"name": {
 						"type": "string",
 						"description": "name",
+						"anyOf": [{"type": "null"}],
 						"pattern": "^[a-z]+$",
 						"default": "ada",
 						"enum": ["ada", "grace"]
@@ -245,19 +260,33 @@ func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
 						"items": {
 							"type": "string",
 							"description": "tag",
-							"pattern": "^[a-z]$"
+							"anyOf": [{"type": "null"}],
+							"pattern": "^[a-z]$",
+							"items": {"type": "number"},
+							"additionalProperties": false,
+							"default": "kept-on-items",
+							"enum": ["a"]
 						}
 					}
 				},
+				"items": {"type": "string", "default": "kept"},
+				"additionalProperties": false,
+				"default": 1,
+				"enum": ["a"],
 				"$ref": "#/$defs/Root",
 				"$defs": {
 					"Item": {
 						"type": "object",
 						"description": "item def",
+						"anyOf": [{"type": "null"}],
 						"required": ["label"],
 						"properties": {
 							"label": {"type": "string", "default": "n", "enum": ["n", "y"]}
-						}
+						},
+						"items": {"type": "integer"},
+						"additionalProperties": false,
+						"default": "nope",
+						"enum": ["x"]
 					}
 				}
 			}`,
@@ -310,7 +339,130 @@ func TestConvertMCPSchema_Basic(t *testing.T) {
 }
 
 func TestConvertProperties_Nil(t *testing.T) {
-	require.Nil(t, convertProperties(nil))
+	schema := convertMCPSchemaToSchema(map[string]any{"type": "object"})
+	require.Nil(t, schema.Properties)
+}
+
+func TestConvertMCPSchema_OneOfMergedIntoAnyOf(t *testing.T) {
+	requireConvertedJSON(t, `{
+		"type": "object",
+		"properties": {
+			"mode": {"oneOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "integer"}]}
+		}
+	}`, `{
+		"type": "object",
+		"properties": {
+			"mode": {"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "integer"}]}
+		}
+	}`)
+
+	// Keyword anyOf branches come first, oneOf branches append after.
+	requireConvertedJSON(t, `{
+		"description": "d",
+		"oneOf": [{"type": "integer"}],
+		"anyOf": [{"type": "string"}]
+	}`, `{
+		"description": "d",
+		"anyOf": [{"type": "string"}, {"type": "integer"}]
+	}`)
+}
+
+func TestConvertMCPSchema_ConstBecomesEnum(t *testing.T) {
+	// const is a one-value enum; the type comes from the value when absent.
+	requireConvertedJSON(t, `{"const": "US"}`, `{"type": "string", "enum": ["US"]}`)
+	requireConvertedJSON(t,
+		`{"type": "integer", "description": "d", "const": 5}`,
+		`{"type": "integer", "description": "d", "enum": [5]}`)
+	requireConvertedJSON(t, `{"const": true}`, `{"type": "boolean", "enum": [true]}`)
+	requireConvertedJSON(t, `{"const": null}`, `{"type": "null", "enum": [null]}`)
+	// An explicit enum wins over const.
+	requireConvertedJSON(t,
+		`{"const": "US", "enum": ["US", "CA"]}`,
+		`{"type": "string", "enum": ["US", "CA"]}`)
+}
+
+func TestConvertMCPSchema_TupleAndPrefixItems(t *testing.T) {
+	requireConvertedJSON(t, `{
+		"type": "array",
+		"items": [{"type": "string"}, {"type": "integer"}]
+	}`, `{
+		"type": "array",
+		"items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+	}`)
+
+	requireConvertedJSON(t, `{
+		"type": "array",
+		"prefixItems": [{"type": "string"}],
+		"items": {"type": "number"}
+	}`, `{
+		"type": "array",
+		"items": {"anyOf": [{"type": "string"}, {"type": "number"}]}
+	}`)
+}
+
+func TestConvertMCPSchema_NestedArrayItemsKept(t *testing.T) {
+	requireConvertedJSON(t, `{
+		"type": "array",
+		"items": {"type": "array", "items": {"type": "string", "enum": ["x", "y"], "default": "x"}}
+	}`, `{
+		"type": "array",
+		"items": {"type": "array", "items": {"type": "string", "default": "x", "enum": ["x", "y"]}}
+	}`)
+}
+
+func TestConvertMCPSchema_AllOfMerged(t *testing.T) {
+	// Members merge: properties union, required union, absent keywords fill in.
+	requireConvertedJSON(t, `{
+		"description": "own",
+		"allOf": [
+			{"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+			{"properties": {"b": {"type": "integer"}}}
+		]
+	}`, `{
+		"type": "object",
+		"description": "own",
+		"required": ["a"],
+		"properties": {"a": {"type": "string"}, "b": {"type": "integer"}}
+	}`)
+
+	// Two schemas for the same property become a choice.
+	requireConvertedJSON(t, `{
+		"allOf": [
+			{"properties": {"x": {"type": "string"}}},
+			{"properties": {"x": {"type": "integer"}}}
+		]
+	}`, `{
+		"properties": {"x": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
+	}`)
+
+	// Enums intersect.
+	requireConvertedJSON(t,
+		`{"enum": ["a", "b", "c"], "allOf": [{"enum": ["b", "c", "d"]}]}`,
+		`{"enum": ["b", "c"]}`)
+}
+
+func TestConvertMCPSchema_MalformedKeywordsDropped(t *testing.T) {
+	// A malformed keyword must never fail the whole schema. Booleans: true is
+	// the empty schema (any value); false and non-schema shapes are dropped.
+	requireConvertedJSON(t, `{
+		"type": "object",
+		"properties": {"good": {"type": "string"}, "gone": false, "anything": true},
+		"required": ["good", 5, "also-good"],
+		"items": "not a schema"
+	}`, `{
+		"type": "object",
+		"required": ["good", "also-good"],
+		"properties": {"anything": {}, "good": {"type": "string"}}
+	}`)
+
+	// Boolean anyOf members cannot be represented and are dropped.
+	requireConvertedJSON(t,
+		`{"anyOf": [{"type": "string"}, true, false]}`,
+		`{"anyOf": [{"type": "string"}]}`)
+
+	// items: false means "only the empty array"; tool.Schema cannot say that,
+	// so the keyword is dropped rather than failing conversion.
+	requireConvertedJSON(t, `{"type": "array", "items": false}`, `{"type": "array"}`)
 }
 
 func TestConvertMCPSchema_InvalidJSON(t *testing.T) {
