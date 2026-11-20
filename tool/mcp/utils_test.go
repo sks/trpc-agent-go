@@ -170,6 +170,10 @@ func TestConvertMCPSchema_TypeListKeywordSplit(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"type": ["array", "string"], "items": {"type": "integer"}, "pattern": "^x$"}`,
 		`{"anyOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "string", "pattern": "^x$"}]}`)
+	// The transplant set covers bounds and counts, not only child schemas.
+	requireConvertedJSON(t,
+		`{"type": ["string", "number"], "minLength": 2, "minimum": 0}`,
+		`{"anyOf": [{"type": "string", "minLength": 2}, {"type": "number", "minimum": 0}]}`)
 	// A single-type list keeps the node's keywords in place.
 	requireConvertedJSON(t,
 		`{"type": ["array"], "items": {"type": "integer"}}`,
@@ -189,9 +193,9 @@ func TestNormalizeSchemaReportsChanges(t *testing.T) {
 	out, changes := tool.NormalizeSchema(input)
 	require.NotNil(t, out)
 	require.ElementsMatch(t, []tool.SchemaChange{
-		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf},
-		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple},
-		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed},
+		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf, Keys: []string{"oneOf"}},
+		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple, Keys: []string{"items"}},
+		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed, Keys: []string{"items"}},
 		{Path: "properties.free", Kind: tool.SchemaChangeBoolean},
 	}, changes)
 	// The caller's map is unchanged.
