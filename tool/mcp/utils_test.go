@@ -119,25 +119,35 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 				"enum": [null, 50, 100]
 			},
 			"options": {
-				"anyOf": [{"type": "object"}, {"type": "null"}],
-				"required": ["name"],
-				"properties": {
-					"name": {
-						"anyOf": [{"type": "string"}, {"type": "null"}],
-						"pattern": "^[a-z]+$"
-					}
-				}
+				"anyOf": [
+					{
+						"type": "object",
+						"required": ["name"],
+						"properties": {
+							"name": {"anyOf": [{"type": "string", "pattern": "^[a-z]+$"}, {"type": "null"}]}
+						}
+					},
+					{"type": "null"}
+				]
 			},
 			"reference": {"$ref": "#/$defs/Value"},
 			"rows": {
-				"anyOf": [{"type": "array"}, {"type": "null"}],
-				"items": {
-					"anyOf": [{"type": "object"}, {"type": "null"}],
-					"properties": {
-						"count": {"anyOf": [{"type": "null"}, {"type": "integer"}]}
+				"anyOf": [
+					{
+						"type": "array",
+						"items": {
+							"anyOf": [
+								{
+									"type": "object",
+									"properties": {"count": {"anyOf": [{"type": "null"}, {"type": "integer"}]}}
+								},
+								{"type": "null"}
+							],
+							"default": "kept-on-items"
+						}
 					},
-					"default": "kept-on-items"
-				}
+					{"type": "null"}
+				]
 			},
 			"title": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
 		},
@@ -147,13 +157,45 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 		"enum": ["root"],
 		"$defs": {
 			"Value": {
-				"anyOf": [{"type": "null"}, {"type": "array"}],
-				"items": {"anyOf": [{"type": "null"}, {"type": "string"}]},
+				"anyOf": [{"type": "null"}, {"type": "array", "items": {"anyOf": [{"type": "null"}, {"type": "string"}]}}],
 				"additionalProperties": false,
 				"default": "kept"
 			}
 		}
 	}`)
+}
+
+func TestConvertMCPSchema_TypeListKeywordSplit(t *testing.T) {
+	// Keywords that belong to one type move into that type's branch.
+	requireConvertedJSON(t,
+		`{"type": ["array", "string"], "items": {"type": "integer"}, "pattern": "^x$"}`,
+		`{"anyOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "string", "pattern": "^x$"}]}`)
+	// A single-type list keeps the node's keywords in place.
+	requireConvertedJSON(t,
+		`{"type": ["array"], "items": {"type": "integer"}}`,
+		`{"anyOf": [{"type": "array"}], "items": {"type": "integer"}}`)
+}
+
+func TestNormalizeSchemaReportsChanges(t *testing.T) {
+	input := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"mode": map[string]any{"oneOf": []any{map[string]any{"type": "string"}}},
+			"rows": map[string]any{"type": "array", "items": []any{map[string]any{"type": "string"}}},
+			"bad":  map[string]any{"items": "x"},
+			"free": true,
+		},
+	}
+	out, changes := tool.NormalizeSchema(input)
+	require.NotNil(t, out)
+	require.ElementsMatch(t, []tool.SchemaChange{
+		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf},
+		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple},
+		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed},
+		{Path: "properties.free", Kind: tool.SchemaChangeBoolean},
+	}, changes)
+	// The caller's map is unchanged.
+	require.Contains(t, input["properties"].(map[string]any)["mode"].(map[string]any), "oneOf")
 }
 
 func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
