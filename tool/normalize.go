@@ -511,14 +511,19 @@ func (n *schemaNormalizer) rewriteConst(node map[string]any, path string) {
 	n.record(path, SchemaChangeConst, original)
 }
 
-// jsonTypeOf returns the JSON Schema type of a decoded JSON value.
+// jsonTypeOf returns the JSON Schema type of a decoded JSON value. A whole
+// number is an integer: JSON has one number type, but JSON Schema and Schema
+// distinguish whole-valued numbers.
 func jsonTypeOf(value any) string {
-	switch value.(type) {
+	switch v := value.(type) {
 	case string:
 		return "string"
 	case bool:
 		return "boolean"
 	case float64:
+		if v == math.Trunc(v) {
+			return "integer"
+		}
 		return "number"
 	case []any:
 		return "array"
@@ -541,11 +546,24 @@ var keywordsForSchemaType = map[string][]string{
 	"integer": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"},
 }
 
+// typeSpecificKeyword is the set of every keyword in keywordsForSchemaType.
+var typeSpecificKeyword = func() map[string]bool {
+	out := map[string]bool{}
+	for _, keys := range keywordsForSchemaType {
+		for _, key := range keys {
+			out[key] = true
+		}
+	}
+	return out
+}()
+
 // rewriteTypeList rewrites a type list, such as ["string", "null"], as anyOf
 // branches, one per type, appended after any existing anyOf branches. With
-// several types, each branch receives the keywords that belong to its type;
-// with a single type the node's keywords stay in place. Members that are not
-// type-name strings are ignored.
+// several types, each branch receives the keywords that belong to its type,
+// and keywords owned by types the list does not contain are dropped, since no
+// value of a listed type could ever satisfy them. With a single type the
+// node's keywords stay in place. Members that are not type-name strings are
+// ignored.
 func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 	raw, ok := node["type"].([]any)
 	if !ok {
@@ -565,21 +583,64 @@ func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 	original := shallowCopy(node)
 	delete(node, "type")
 	branches := make([]any, 0, len(names))
+	claimed := map[string]bool{}
 	for _, name := range names {
 		branch := map[string]any{"type": name}
 		if len(names) > 1 {
 			for _, key := range keywordsForSchemaType[name] {
 				if value, exists := node[key]; exists {
 					branch[key] = value
-					delete(node, key)
+					claimed[key] = true
 				}
 			}
 		}
 		branches = append(branches, branch)
 	}
+	for key := range claimed {
+		delete(node, key)
+	}
+	if len(names) > 1 {
+		// A keyword owned by a type the list does not contain can never apply;
+		// leaving it beside the branches would let it survive as orphan data.
+		for key := range typeSpecificKeyword {
+			if !claimed[key] {
+				delete(node, key)
+			}
+		}
+	}
 	existing, _ := node["anyOf"].([]any)
 	node["anyOf"] = append(existing, branches...)
 	n.record(path, SchemaChangeTypeList, original)
+}
+
+// keywordValueShape lists, for each keyword Schema holds as a typed field,
+// the JSON shape its value must have to survive decoding. A value of another
+// shape would fail the whole conversion, so sanitize drops just the keyword.
+var keywordValueShape = map[string]func(any) bool{
+	"type":             func(v any) bool { _, ok := v.(string); return ok },
+	"description":      isStringValue,
+	"format":           isStringValue,
+	"pattern":          isStringValue,
+	"$ref":             isStringValue,
+	"minimum":          isNumberValue,
+	"maximum":          isNumberValue,
+	"exclusiveMinimum": isNumberValue,
+	"exclusiveMaximum": isNumberValue,
+	"minLength":        isCountValue,
+	"maxLength":        isCountValue,
+}
+
+// isStringValue reports whether v is a JSON string.
+func isStringValue(v any) bool { _, ok := v.(string); return ok }
+
+// isNumberValue reports whether v is a JSON number.
+func isNumberValue(v any) bool { _, ok := v.(float64); return ok }
+
+// isCountValue reports whether v is a whole, non-negative JSON number, which
+// Schema stores as an unsigned integer.
+func isCountValue(v any) bool {
+	n, ok := v.(float64)
+	return ok && n >= 0 && n == math.Trunc(n)
 }
 
 // sanitizeKeywords drops keywords whose value shape would fail Schema
@@ -587,13 +648,13 @@ func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 // malformed keyword keeps every other keyword instead of failing the whole
 // conversion.
 func (n *schemaNormalizer) sanitizeKeywords(node map[string]any, path string) {
-	for _, key := range []string{"type", "description", "pattern", "$ref"} {
-		if value, exists := node[key]; exists {
-			if _, ok := value.(string); !ok {
-				delete(node, key)
-				n.record(joinPath(path, key), SchemaChangeMalformed, oneKeyword(key, value))
-			}
+	for key, valid := range keywordValueShape {
+		value, exists := node[key]
+		if !exists || valid(value) {
+			continue
 		}
+		delete(node, key)
+		n.record(joinPath(path, key), SchemaChangeMalformed, oneKeyword(key, value))
 	}
 	if value, exists := node["enum"]; exists {
 		if _, ok := value.([]any); !ok {

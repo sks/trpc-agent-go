@@ -158,7 +158,6 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 		"$defs": {
 			"Value": {
 				"anyOf": [{"type": "null"}, {"type": "array", "items": {"anyOf": [{"type": "null"}, {"type": "string"}]}}],
-				"additionalProperties": false,
 				"default": "kept"
 			}
 		}
@@ -178,6 +177,43 @@ func TestConvertMCPSchema_TypeListKeywordSplit(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"type": ["array"], "items": {"type": "integer"}}`,
 		`{"anyOf": [{"type": "array"}], "items": {"type": "integer"}}`)
+	// A keyword for a type the list does not contain can never apply, so it is
+	// dropped instead of hanging beside the branches.
+	requireConvertedJSON(t,
+		`{"type": ["string", "array"], "properties": {"a": {"type": "integer"}}, "minLength": 2}`,
+		`{"anyOf": [{"type": "string", "minLength": 2}, {"type": "array"}]}`)
+}
+
+func TestConvertMCPSchema_MalformedValueShapesDropped(t *testing.T) {
+	// Bounds and counts must decode into Schema's typed fields; a value of the
+	// wrong shape is dropped so the rest of the schema still converts.
+	requireConvertedJSON(t,
+		`{"type": "string", "minLength": -1}`,
+		`{"type": "string"}`)
+	requireConvertedJSON(t,
+		`{"type": "string", "maxLength": 1.5}`,
+		`{"type": "string"}`)
+	requireConvertedJSON(t,
+		`{"type": "number", "minimum": "3"}`,
+		`{"type": "number"}`)
+	requireConvertedJSON(t,
+		`{"type": "string", "format": ["email"]}`,
+		`{"type": "string"}`)
+	// Draft-4 boolean exclusives are not representable as numbers; the boolean
+	// is dropped rather than failing the conversion.
+	requireConvertedJSON(t,
+		`{"type": "number", "minimum": 0, "exclusiveMinimum": true}`,
+		`{"type": "number", "minimum": 0}`)
+}
+
+func TestConvertMCPSchema_ConstantWholeNumberTypesAsInteger(t *testing.T) {
+	// JSON has one number type; JSON Schema calls a whole number an integer.
+	requireConvertedJSON(t,
+		`{"const": 5}`,
+		`{"type": "integer", "enum": [5]}`)
+	requireConvertedJSON(t,
+		`{"const": 5.5}`,
+		`{"type": "number", "enum": [5.5]}`)
 }
 
 func TestNormalizeSchemaReportsChanges(t *testing.T) {
