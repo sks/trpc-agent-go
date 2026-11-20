@@ -158,7 +158,6 @@ func TestConvertMCPSchema_TypeArraysAtSupportedPositions(t *testing.T) {
 		"$defs": {
 			"Value": {
 				"anyOf": [{"type": "null"}, {"type": "array", "items": {"anyOf": [{"type": "null"}, {"type": "string"}]}}],
-				"additionalProperties": false,
 				"default": "kept"
 			}
 		}
@@ -170,10 +169,59 @@ func TestConvertMCPSchema_TypeListKeywordSplit(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"type": ["array", "string"], "items": {"type": "integer"}, "pattern": "^x$"}`,
 		`{"anyOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "string", "pattern": "^x$"}]}`)
+	// The transplant set covers bounds and counts, not only child schemas.
+	requireConvertedJSON(t,
+		`{"type": ["string", "number"], "minLength": 2, "minimum": 0}`,
+		`{"anyOf": [{"type": "string", "minLength": 2}, {"type": "number", "minimum": 0}]}`)
 	// A single-type list keeps the node's keywords in place.
 	requireConvertedJSON(t,
 		`{"type": ["array"], "items": {"type": "integer"}}`,
 		`{"anyOf": [{"type": "array"}], "items": {"type": "integer"}}`)
+	// A keyword for a type the list does not contain can never apply, so it is
+	// dropped instead of hanging beside the branches.
+	requireConvertedJSON(t,
+		`{"type": ["string", "array"], "properties": {"a": {"type": "integer"}}, "minLength": 2}`,
+		`{"anyOf": [{"type": "string", "minLength": 2}, {"type": "array"}]}`)
+}
+
+func TestConvertMCPSchema_MalformedValueShapesDropped(t *testing.T) {
+	// Bounds and counts must decode into Schema's typed fields; a value of the
+	// wrong shape is dropped so the rest of the schema still converts.
+	requireConvertedJSON(t,
+		`{"type": "string", "minLength": -1}`,
+		`{"type": "string"}`)
+	requireConvertedJSON(t,
+		`{"type": "string", "maxLength": 1.5}`,
+		`{"type": "string"}`)
+	requireConvertedJSON(t,
+		`{"type": "number", "minimum": "3"}`,
+		`{"type": "number"}`)
+	requireConvertedJSON(t,
+		`{"type": "string", "format": ["email"]}`,
+		`{"type": "string"}`)
+	// Draft-4 boolean exclusives take their numeric draft-6+ form: true moves
+	// the guarded bound across, false just disappears.
+	requireConvertedJSON(t,
+		`{"type": "number", "minimum": 0, "exclusiveMinimum": true}`,
+		`{"type": "number", "exclusiveMinimum": 0}`)
+	requireConvertedJSON(t,
+		`{"type": "number", "maximum": 5, "exclusiveMaximum": false}`,
+		`{"type": "number", "maximum": 5}`)
+	// A draft-3 "required": true on a property moves into the parent's
+	// required list, keeping existing names and listing added ones in order.
+	requireConvertedJSON(t,
+		`{"type": "object", "required": ["z"], "properties": {"b": {"type": "string", "required": true}, "a": {"type": "integer", "required": true}, "o": {"type": "string", "required": false}}}`,
+		`{"type": "object", "required": ["z", "a", "b"], "properties": {"a": {"type": "integer"}, "b": {"type": "string"}, "o": {"type": "string"}}}`)
+}
+
+func TestConvertMCPSchema_ConstantWholeNumberTypesAsInteger(t *testing.T) {
+	// JSON has one number type; JSON Schema calls a whole number an integer.
+	requireConvertedJSON(t,
+		`{"const": 5}`,
+		`{"type": "integer", "enum": [5]}`)
+	requireConvertedJSON(t,
+		`{"const": 5.5}`,
+		`{"type": "number", "enum": [5.5]}`)
 }
 
 func TestNormalizeSchemaReportsChanges(t *testing.T) {
@@ -189,13 +237,27 @@ func TestNormalizeSchemaReportsChanges(t *testing.T) {
 	out, changes := tool.NormalizeSchema(input)
 	require.NotNil(t, out)
 	require.ElementsMatch(t, []tool.SchemaChange{
-		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf},
-		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple},
-		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed},
+		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf, Keys: []string{"oneOf"}},
+		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple, Keys: []string{"items"}},
+		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed, Keys: []string{"items"}},
 		{Path: "properties.free", Kind: tool.SchemaChangeBoolean},
 	}, changes)
 	// The caller's map is unchanged.
 	require.Contains(t, input["properties"].(map[string]any)["mode"].(map[string]any), "oneOf")
+}
+
+func TestNormalizeSchemaReportsDraftForms(t *testing.T) {
+	input := map[string]any{
+		"type":             "object",
+		"properties":       map[string]any{"id": map[string]any{"type": "string", "required": true}},
+		"minimum":          3.0,
+		"exclusiveMinimum": true,
+	}
+	_, changes := tool.NormalizeSchema(input)
+	require.ElementsMatch(t, []tool.SchemaChange{
+		{Path: "properties.id", Kind: tool.SchemaChangeDraft, Keys: []string{"required", "type"}},
+		{Path: "", Kind: tool.SchemaChangeDraft, Keys: []string{"exclusiveMinimum", "minimum", "properties", "required", "type"}},
+	}, changes)
 }
 
 func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
@@ -481,6 +543,25 @@ func TestConvertMCPSchema_AllOfMerged(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"enum": ["a", "b", "c"], "allOf": [{"enum": ["b", "c", "d"]}]}`,
 		`{"enum": ["b", "c"]}`)
+
+	// Bounds keep the stricter of two values; both must hold, so that is exact.
+	requireConvertedJSON(t,
+		`{"minLength": 1, "maxLength": 30, "allOf": [{"minLength": 5, "maxLength": 20}]}`,
+		`{"minLength": 5, "maxLength": 20}`)
+	requireConvertedJSON(t,
+		`{"minimum": 0, "allOf": [{"minimum": 3, "exclusiveMaximum": 10}]}`,
+		`{"minimum": 3, "exclusiveMaximum": 10}`)
+
+	// The required union is sorted, so the merge is stable no matter which
+	// member listed a name.
+	requireConvertedJSON(t,
+		`{"required": ["b"], "allOf": [{"required": ["a", "c"]}]}`,
+		`{"required": ["a", "b", "c"]}`)
+
+	// Annotations never conflict; the node's own text wins.
+	requireConvertedJSON(t,
+		`{"description": "own", "allOf": [{"description": "member", "type": "string"}]}`,
+		`{"type": "string", "description": "own"}`)
 }
 
 func TestConvertMCPSchema_MalformedKeywordsDropped(t *testing.T) {
