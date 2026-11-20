@@ -189,9 +189,9 @@ func TestNormalizeSchemaReportsChanges(t *testing.T) {
 	out, changes := tool.NormalizeSchema(input)
 	require.NotNil(t, out)
 	require.ElementsMatch(t, []tool.SchemaChange{
-		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf},
-		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple},
-		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed},
+		{Path: "properties.mode", Kind: tool.SchemaChangeOneOf, Keys: []string{"oneOf"}},
+		{Path: "properties.rows.items", Kind: tool.SchemaChangeTuple, Keys: []string{"items"}},
+		{Path: "properties.bad.items", Kind: tool.SchemaChangeMalformed, Keys: []string{"items"}},
 		{Path: "properties.free", Kind: tool.SchemaChangeBoolean},
 	}, changes)
 	// The caller's map is unchanged.

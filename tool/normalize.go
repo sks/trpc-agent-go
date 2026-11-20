@@ -12,6 +12,7 @@ package tool
 import (
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strconv"
 )
 
@@ -49,16 +50,19 @@ const (
 	// cannot express "no value allowed".
 	SchemaChangeBoolean SchemaChangeKind = "boolean_schema"
 	// SchemaChangeTypeList means a list of types, such as ["string", "null"],
-	// became one anyOf branch per type, with type-specific keywords moved into
-	// their branch.
+	// became one anyOf branch per string member, with type-specific keywords
+	// moved into their branch.
 	SchemaChangeTypeList SchemaChangeKind = "type_list"
 )
 
 // SchemaChange records one rewrite NormalizeSchema made at a dotted schema
-// path, such as "properties.params.items". An empty path is the root.
+// path, such as "properties.params.items". An empty path is the root. Keys
+// lists the keyword names the node had before the rewrite, so a caller's log
+// line can show the original shape without logging schema values.
 type SchemaChange struct {
 	Path string
 	Kind SchemaChangeKind
+	Keys []string
 }
 
 // NormalizeSchema rewrites a decoded JSON Schema map into the keyword subset
@@ -91,12 +95,28 @@ type schemaNormalizer struct {
 	changes []SchemaChange
 }
 
-// record appends one change at path.
-func (n *schemaNormalizer) record(path string, kind SchemaChangeKind) {
+// record appends one change at path. original is the node as it looked before
+// the rewrite; only its key names are kept, never values. It may be nil.
+func (n *schemaNormalizer) record(path string, kind SchemaChangeKind, original map[string]any) {
 	if last := len(n.changes) - 1; last >= 0 && n.changes[last].Path == path && n.changes[last].Kind == kind {
 		return
 	}
-	n.changes = append(n.changes, SchemaChange{Path: path, Kind: kind})
+	change := SchemaChange{Path: path, Kind: kind}
+	if original != nil {
+		keys := make([]string, 0, len(original))
+		for key := range original {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		change.Keys = keys
+	}
+	n.changes = append(n.changes, change)
+}
+
+// oneKeyword snapshots a node as "the one keyword that mattered", for change
+// records whose rewrite removed that keyword before recording.
+func oneKeyword(key string, value any) map[string]any {
+	return map[string]any{key: value}
 }
 
 // node rewrites one decoded schema object. Children are normalized first, so
@@ -108,9 +128,10 @@ func (n *schemaNormalizer) node(node map[string]any, path string) map[string]any
 	n.normalizeAdditionalProperties(node, path)
 	n.normalizeBranchList(node, path, "anyOf")
 	n.normalizeBranchList(node, path, "oneOf")
+	allOf := node["allOf"]
 	allOfMembers := n.takeObjectList(node, path, "allOf")
 	if len(allOfMembers) > 0 {
-		n.record(path, SchemaChangeAllOfMerge)
+		n.record(path, SchemaChangeAllOfMerge, oneKeyword("allOf", allOf))
 	}
 	n.mergeAllOf(node, path, allOfMembers)
 	n.mergeOneOfIntoAnyOf(node, path)
@@ -137,8 +158,9 @@ func (n *schemaNormalizer) normalizeObjectMap(node map[string]any, path, key str
 	schemas, ok := node[key].(map[string]any)
 	if !ok {
 		if _, exists := node[key]; exists {
+			original := node[key]
 			delete(node, key)
-			n.record(path, SchemaChangeMalformed)
+			n.record(path, SchemaChangeMalformed, oneKeyword(key, original))
 		}
 		return
 	}
@@ -148,7 +170,7 @@ func (n *schemaNormalizer) normalizeObjectMap(node map[string]any, path, key str
 		case map[string]any:
 			schemas[name] = n.node(v, childPath)
 		case bool:
-			n.record(childPath, SchemaChangeBoolean)
+			n.record(childPath, SchemaChangeBoolean, nil)
 			if !v {
 				delete(schemas, name)
 				continue
@@ -156,7 +178,7 @@ func (n *schemaNormalizer) normalizeObjectMap(node map[string]any, path, key str
 			schemas[name] = map[string]any{}
 		default:
 			delete(schemas, name)
-			n.record(childPath, SchemaChangeMalformed)
+			n.record(childPath, SchemaChangeMalformed, nil)
 		}
 	}
 }
@@ -180,18 +202,18 @@ func (n *schemaNormalizer) normalizeItems(node map[string]any, path string) {
 			positions := n.normalizedObjects(v, itemsPath)
 			if len(positions) == 0 {
 				delete(node, "items")
-				n.record(itemsPath, SchemaChangeMalformed)
+				n.record(itemsPath, SchemaChangeMalformed, oneKeyword("items", raw))
 				return
 			}
 			node["items"] = map[string]any{"anyOf": positions}
-			n.record(itemsPath, SchemaChangeTuple)
+			n.record(itemsPath, SchemaChangeTuple, oneKeyword("items", raw))
 		case bool:
 			delete(node, "items")
-			n.record(itemsPath, SchemaChangeBoolean)
+			n.record(itemsPath, SchemaChangeBoolean, oneKeyword("items", raw))
 		default:
 			if raw != nil {
 				delete(node, "items")
-				n.record(itemsPath, SchemaChangeMalformed)
+				n.record(itemsPath, SchemaChangeMalformed, oneKeyword("items", raw))
 			}
 		}
 		return
@@ -204,7 +226,7 @@ func (n *schemaNormalizer) normalizeItems(node map[string]any, path string) {
 		positions = append(positions, n.normalizedObjects(v, itemsPath)...)
 	}
 	node["items"] = map[string]any{"anyOf": positions}
-	n.record(itemsPath, SchemaChangeTuple)
+	n.record(itemsPath, SchemaChangeTuple, map[string]any{"items": raw, "prefixItems": prefix})
 }
 
 // normalizeAdditionalProperties keeps boolean values, normalizes the schema
@@ -215,9 +237,9 @@ func (n *schemaNormalizer) normalizeAdditionalProperties(node map[string]any, pa
 		node["additionalProperties"] = n.node(v, joinPath(path, "additionalProperties"))
 	case bool:
 	default:
-		if _, exists := node["additionalProperties"]; exists {
+		if raw, exists := node["additionalProperties"]; exists {
 			delete(node, "additionalProperties")
-			n.record(joinPath(path, "additionalProperties"), SchemaChangeMalformed)
+			n.record(joinPath(path, "additionalProperties"), SchemaChangeMalformed, oneKeyword("additionalProperties", raw))
 		}
 	}
 }
@@ -228,15 +250,15 @@ func (n *schemaNormalizer) normalizeAdditionalProperties(node map[string]any, pa
 func (n *schemaNormalizer) normalizeBranchList(node map[string]any, path, key string) {
 	raw, ok := node[key].([]any)
 	if !ok {
-		if _, exists := node[key]; exists {
+		if original, exists := node[key]; exists {
 			delete(node, key)
-			n.record(joinPath(path, key), SchemaChangeMalformed)
+			n.record(joinPath(path, key), SchemaChangeMalformed, oneKeyword(key, original))
 		}
 		return
 	}
 	branches := n.normalizedObjects(raw, joinPath(path, key))
 	if len(branches) != len(raw) {
-		n.record(joinPath(path, key), SchemaChangeBoolean)
+		n.record(joinPath(path, key), SchemaChangeBoolean, oneKeyword(key, raw))
 	}
 	if len(branches) == 0 {
 		delete(node, key)
@@ -253,7 +275,7 @@ func (n *schemaNormalizer) takeObjectList(node map[string]any, path, key string)
 	list, ok := raw.([]any)
 	if !ok {
 		if exists {
-			n.record(joinPath(path, key), SchemaChangeMalformed)
+			n.record(joinPath(path, key), SchemaChangeMalformed, oneKeyword(key, raw))
 		}
 		return nil
 	}
@@ -312,7 +334,7 @@ func (n *schemaNormalizer) mergeSchemaInto(dst map[string]any, path string, memb
 				continue
 			}
 			if !reflect.DeepEqual(existing, value) {
-				n.record(path, SchemaChangeAllOfConflict)
+				n.record(path, SchemaChangeAllOfConflict, oneKeyword(key, existing))
 			}
 		}
 	}
@@ -338,7 +360,7 @@ func (n *schemaNormalizer) mergeProperties(dst map[string]any, path string, valu
 			continue
 		}
 		existing[name] = map[string]any{"anyOf": []any{current, prop}}
-		n.record(path, SchemaChangeAllOfConflict)
+		n.record(path, SchemaChangeAllOfConflict, nil)
 	}
 	dst["properties"] = existing
 }
@@ -386,16 +408,18 @@ func intersectEnums(existing, value any) any {
 	return out
 }
 
-// mergeOneOfIntoAnyOf appends oneOf branches to anyOf.
+// mergeOneOfIntoAnyOf appends oneOf branches to anyOf. The two differ only in
+// that oneOf forbids matching more than one branch, which Schema cannot
+// express.
 func (n *schemaNormalizer) mergeOneOfIntoAnyOf(node map[string]any, path string) {
 	oneOf, ok := node["oneOf"].([]any)
-	delete(node, "oneOf")
 	if !ok {
 		return
 	}
+	delete(node, "oneOf")
 	existing, _ := node["anyOf"].([]any)
 	node["anyOf"] = append(existing, oneOf...)
-	n.record(path, SchemaChangeOneOf)
+	n.record(path, SchemaChangeOneOf, oneKeyword("oneOf", oneOf))
 }
 
 // rewriteConst rewrites const as a one-value enum: the two are the same
@@ -403,21 +427,19 @@ func (n *schemaNormalizer) mergeOneOfIntoAnyOf(node map[string]any, path string)
 // a const-only node stays typed.
 func (n *schemaNormalizer) rewriteConst(node map[string]any, path string) {
 	value, ok := node["const"]
-	delete(node, "const")
 	if !ok {
 		return
 	}
+	delete(node, "const")
 	if _, has := node["enum"]; !has {
 		node["enum"] = []any{value}
 	}
-	if _, has := node["type"]; has {
-		n.record(path, SchemaChangeConst)
-		return
+	if _, has := node["type"]; !has {
+		if t := jsonTypeOf(value); t != "" {
+			node["type"] = t
+		}
 	}
-	if t := jsonTypeOf(value); t != "" {
-		node["type"] = t
-	}
-	n.record(path, SchemaChangeConst)
+	n.record(path, SchemaChangeConst, oneKeyword("const", value))
 }
 
 // jsonTypeOf returns the JSON Schema type of a decoded JSON value.
@@ -439,28 +461,27 @@ func jsonTypeOf(value any) string {
 	return ""
 }
 
-// keywordsForSchemaType lists the keywords that only apply to one JSON type.
+// keywordsForSchemaType lists the keywords that constrain only one JSON type.
 // They move into that type's branch when a type list is split, so a node
 // mixing "array" and "string" does not leave items beside a string branch.
 var keywordsForSchemaType = map[string][]string{
-	"array":   {"items", "prefixItems"},
-	"object":  {"properties", "required", "additionalProperties"},
-	"string":  {"pattern"},
-	"number":  {},
-	"integer": {},
+	"array":   {"items", "prefixItems", "minItems", "maxItems", "uniqueItems"},
+	"object":  {"properties", "required", "additionalProperties", "minProperties", "maxProperties"},
+	"string":  {"pattern", "format", "minLength", "maxLength"},
+	"number":  {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"},
+	"integer": {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"},
 }
 
 // rewriteTypeList rewrites a type list, such as ["string", "null"], as anyOf
-// branches, one per type, appended after any existing anyOf branches. Each
-// branch receives the keywords that belong to its type; the other keywords
-// stay on the node, where they apply to every branch. Members that are not
+// branches, one per type, appended after any existing anyOf branches. With
+// several types, each branch receives the keywords that belong to its type;
+// with a single type the node's keywords stay in place. Members that are not
 // type-name strings are ignored.
 func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 	raw, ok := node["type"].([]any)
 	if !ok {
 		return
 	}
-	delete(node, "type")
 	var names []string
 	for _, item := range raw {
 		if name, ok := item.(string); ok {
@@ -468,16 +489,19 @@ func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 		}
 	}
 	if len(names) == 0 {
-		n.record(path, SchemaChangeMalformed)
+		delete(node, "type")
+		n.record(path, SchemaChangeMalformed, oneKeyword("type", raw))
 		return
 	}
+	original := make(map[string]any, len(node))
+	for key, value := range node {
+		original[key] = value
+	}
+	delete(node, "type")
 	branches := make([]any, 0, len(names))
 	for _, name := range names {
 		branch := map[string]any{"type": name}
 		if len(names) > 1 {
-			// With several types on one node, a type-specific keyword applies
-			// only to its own type's branch; a single-branch list keeps the
-			// node's keywords where they are.
 			for _, key := range keywordsForSchemaType[name] {
 				if value, exists := node[key]; exists {
 					branch[key] = value
@@ -489,7 +513,7 @@ func (n *schemaNormalizer) rewriteTypeList(node map[string]any, path string) {
 	}
 	existing, _ := node["anyOf"].([]any)
 	node["anyOf"] = append(existing, branches...)
-	n.record(path, SchemaChangeTypeList)
+	n.record(path, SchemaChangeTypeList, original)
 }
 
 // sanitizeKeywords drops keywords whose value shape would fail Schema
@@ -501,14 +525,14 @@ func (n *schemaNormalizer) sanitizeKeywords(node map[string]any, path string) {
 		if value, exists := node[key]; exists {
 			if _, ok := value.(string); !ok {
 				delete(node, key)
-				n.record(joinPath(path, key), SchemaChangeMalformed)
+				n.record(joinPath(path, key), SchemaChangeMalformed, oneKeyword(key, value))
 			}
 		}
 	}
 	if value, exists := node["enum"]; exists {
 		if _, ok := value.([]any); !ok {
 			delete(node, "enum")
-			n.record(joinPath(path, "enum"), SchemaChangeMalformed)
+			n.record(joinPath(path, "enum"), SchemaChangeMalformed, oneKeyword("enum", value))
 		}
 	}
 	required, exists := node["required"]
@@ -518,7 +542,7 @@ func (n *schemaNormalizer) sanitizeKeywords(node map[string]any, path string) {
 	list, ok := required.([]any)
 	if !ok {
 		delete(node, "required")
-		n.record(joinPath(path, "required"), SchemaChangeMalformed)
+		n.record(joinPath(path, "required"), SchemaChangeMalformed, oneKeyword("required", required))
 		return
 	}
 	names := make([]any, 0, len(list))
@@ -527,7 +551,7 @@ func (n *schemaNormalizer) sanitizeKeywords(node map[string]any, path string) {
 			names = append(names, item)
 			continue
 		}
-		n.record(joinPath(path, "required"), SchemaChangeMalformed)
+		n.record(joinPath(path, "required"), SchemaChangeMalformed, oneKeyword("required", required))
 	}
 	node["required"] = names
 }
