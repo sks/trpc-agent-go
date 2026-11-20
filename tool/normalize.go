@@ -11,6 +11,7 @@ package tool
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -331,20 +332,37 @@ func (n *schemaNormalizer) mergeAllOf(node map[string]any, path string, members 
 	}
 }
 
+// lowerBoundKeyword and upperBoundKeyword are the numeric keywords where an
+// allOf merge keeps the stricter of two values, which is exact.
+var (
+	lowerBoundKeyword = map[string]bool{"minimum": true, "exclusiveMinimum": true, "minLength": true, "minItems": true, "minProperties": true}
+	upperBoundKeyword = map[string]bool{"maximum": true, "exclusiveMaximum": true, "maxLength": true, "maxItems": true, "maxProperties": true}
+)
+
+// annotationKeyword lists keywords that describe a schema without limiting its
+// values, so two different values never conflict.
+var annotationKeyword = map[string]bool{"description": true, "title": true, "default": true, "examples": true, "$comment": true}
+
 // mergeSchemaInto merges one normalized allOf member into dst.
 func (n *schemaNormalizer) mergeSchemaInto(dst map[string]any, path string, member map[string]any) {
 	for key, value := range member {
-		switch key {
-		case "properties":
+		switch {
+		case key == "properties":
 			n.mergeProperties(dst, path, value)
-		case "required":
+		case key == "required":
 			dst["required"] = unionRequired(dst["required"], value)
-		case "enum":
+		case key == "enum":
 			if existing, ok := dst["enum"]; ok {
 				dst["enum"] = intersectEnums(existing, value)
 				continue
 			}
 			dst[key] = value
+		case lowerBoundKeyword[key]:
+			dst[key] = pickStricterNumber(dst[key], value, math.Max)
+		case upperBoundKeyword[key]:
+			dst[key] = pickStricterNumber(dst[key], value, math.Min)
+		case annotationKeyword[key]:
+			// Two annotations never conflict; the node's own text wins.
 		default:
 			existing, exists := dst[key]
 			if !exists {
@@ -356,6 +374,28 @@ func (n *schemaNormalizer) mergeSchemaInto(dst map[string]any, path string, memb
 			}
 		}
 	}
+}
+
+// pickStricterNumber applies pick to two allOf-bound numbers, or keeps the
+// existing one when the incoming value is not a number.
+func pickStricterNumber(existing, incoming any, pick func(float64, float64) float64) any {
+	x, okX := jsonNumber(existing)
+	if !okX {
+		return incoming
+	}
+	y, okY := jsonNumber(incoming)
+	if !okY {
+		return existing
+	}
+	return pick(x, y)
+}
+
+// jsonNumber reads a decoded JSON number.
+func jsonNumber(value any) (float64, bool) {
+	if v, ok := value.(float64); ok {
+		return v, true
+	}
+	return 0, false
 }
 
 // mergeProperties unions the member's properties into dst's, by name. Two
@@ -383,25 +423,34 @@ func (n *schemaNormalizer) mergeProperties(dst map[string]any, path string, valu
 	dst["properties"] = existing
 }
 
-// unionRequired appends the member's required names that the node does not
-// already list. Members are normalized but their required entries were not
-// yet filtered to strings, so non-strings are skipped here.
+// unionRequired returns the sorted union of two required lists. Members are
+// normalized but their required entries were not yet filtered to strings, so
+// non-strings are skipped. Sorting keeps the result stable no matter which
+// allOf member listed a name.
 func unionRequired(existing, value any) []any {
-	out, _ := existing.([]any)
-	seen := make(map[string]bool, len(out))
-	for _, name := range out {
-		if s, ok := name.(string); ok {
-			seen[s] = true
+	seen := map[string]bool{}
+	for _, list := range []any{existing, value} {
+		names, _ := list.([]any)
+		for _, name := range names {
+			if s, ok := name.(string); ok {
+				seen[s] = true
+			}
 		}
 	}
-	incoming, _ := value.([]any)
-	for _, name := range incoming {
-		s, ok := name.(string)
-		if ok && !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
+	out := make([]any, 0, len(seen))
+	for _, name := range keyNamesBool(seen) {
+		out = append(out, name)
 	}
+	return out
+}
+
+// keyNamesBool returns a set's keys in order.
+func keyNamesBool(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
 	return out
 }
 

@@ -485,6 +485,25 @@ func TestConvertMCPSchema_AllOfMerged(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"enum": ["a", "b", "c"], "allOf": [{"enum": ["b", "c", "d"]}]}`,
 		`{"enum": ["b", "c"]}`)
+
+	// Bounds keep the stricter of two values; both must hold, so that is exact.
+	requireConvertedJSON(t,
+		`{"minLength": 1, "maxLength": 30, "allOf": [{"minLength": 5, "maxLength": 20}]}`,
+		`{"minLength": 5, "maxLength": 20}`)
+	requireConvertedJSON(t,
+		`{"minimum": 0, "allOf": [{"minimum": 3, "exclusiveMaximum": 10}]}`,
+		`{"minimum": 3, "exclusiveMaximum": 10}`)
+
+	// The required union is sorted, so the merge is stable no matter which
+	// member listed a name.
+	requireConvertedJSON(t,
+		`{"required": ["b"], "allOf": [{"required": ["a", "c"]}]}`,
+		`{"required": ["a", "b", "c"]}`)
+
+	// Annotations never conflict; the node's own text wins.
+	requireConvertedJSON(t,
+		`{"description": "own", "allOf": [{"description": "member", "type": "string"}]}`,
+		`{"type": "string", "description": "own"}`)
 }
 
 func TestConvertMCPSchema_MalformedKeywordsDropped(t *testing.T) {
