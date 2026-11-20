@@ -54,6 +54,11 @@ const (
 	// became one anyOf branch per string member, with type-specific keywords
 	// moved into their branch.
 	SchemaChangeTypeList SchemaChangeKind = "type_list"
+	// SchemaChangeDraft means an older-draft keyword took its current form: a
+	// draft-4 boolean exclusiveMinimum/exclusiveMaximum became the numeric
+	// bound it guarded, or a draft-3 "required": true on a property moved into
+	// the parent's required list. Both rewrites keep the exact constraint.
+	SchemaChangeDraft SchemaChangeKind = "draft_form"
 )
 
 // SchemaChange records one rewrite NormalizeSchema made at a dotted schema
@@ -144,6 +149,7 @@ func (n *schemaNormalizer) node(node map[string]any, path string) map[string]any
 	n.normalizeAdditionalProperties(node, path)
 	n.normalizeBranchList(node, path, "anyOf")
 	n.normalizeBranchList(node, path, "oneOf")
+	n.rewriteDraftForms(node, path)
 	var allOfSnapshot map[string]any
 	if node["allOf"] != nil {
 		allOfSnapshot = shallowCopy(node)
@@ -183,10 +189,14 @@ func (n *schemaNormalizer) normalizeObjectMap(node map[string]any, path, key str
 		}
 		return
 	}
-	for name, raw := range schemas {
+	for _, name := range keyNames(schemas) {
+		raw := schemas[name]
 		childPath := joinPath(path, key+"."+name)
 		switch v := raw.(type) {
 		case map[string]any:
+			if key == "properties" {
+				n.rewriteDraftThreeRequired(node, childPath, name, v)
+			}
 			schemas[name] = n.node(v, childPath)
 		case bool:
 			n.record(childPath, SchemaChangeBoolean, nil)
@@ -533,6 +543,59 @@ func jsonTypeOf(value any) string {
 		return "null"
 	}
 	return ""
+}
+
+// rewriteDraftForms upgrades older-draft keywords to their current form so a
+// schema declared against draft-3 or draft-4 keeps its exact meaning. A
+// draft-4 boolean exclusiveMinimum: true moves the guarded minimum across,
+// and false just disappears; a draft-3 "required": true on a property joins
+// the node's required list. The draft forms would otherwise fail Schema
+// decoding (the boolean) or silently stop requiring the property.
+func (n *schemaNormalizer) rewriteDraftForms(node map[string]any, path string) {
+	original := shallowCopy(node)
+	draftFour := false
+	for exclusive, bound := range map[string]string{"exclusiveMinimum": "minimum", "exclusiveMaximum": "maximum"} {
+		flag, ok := node[exclusive].(bool)
+		if !ok {
+			continue
+		}
+		draftFour = true
+		delete(node, exclusive)
+		if !flag {
+			continue
+		}
+		if value, exists := node[bound]; exists {
+			node[exclusive] = value
+			delete(node, bound)
+		}
+	}
+	if draftFour {
+		n.record(path, SchemaChangeDraft, original)
+	}
+}
+
+// rewriteDraftThreeRequired moves a draft-3 "required": true from a property
+// schema into the parent's required list, keeping every name already there.
+// It runs where the property's context is visible, because a boolean required
+// anywhere else, such as on an items schema, is malformed instead. A
+// "required": false just disappears, which is what false already means.
+func (n *schemaNormalizer) rewriteDraftThreeRequired(node map[string]any, childPath, name string, child map[string]any) {
+	flag, isBool := child["required"].(bool)
+	if !isBool {
+		return
+	}
+	n.record(childPath, SchemaChangeDraft, shallowCopy(child))
+	delete(child, "required")
+	if !flag {
+		return
+	}
+	required, _ := node["required"].([]any)
+	for _, item := range required {
+		if item == name {
+			return
+		}
+	}
+	node["required"] = append(append([]any{}, required...), name)
 }
 
 // keywordsForSchemaType lists the keywords that constrain only one JSON type.

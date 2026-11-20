@@ -199,11 +199,19 @@ func TestConvertMCPSchema_MalformedValueShapesDropped(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"type": "string", "format": ["email"]}`,
 		`{"type": "string"}`)
-	// Draft-4 boolean exclusives are not representable as numbers; the boolean
-	// is dropped rather than failing the conversion.
+	// Draft-4 boolean exclusives take their numeric draft-6+ form: true moves
+	// the guarded bound across, false just disappears.
 	requireConvertedJSON(t,
 		`{"type": "number", "minimum": 0, "exclusiveMinimum": true}`,
-		`{"type": "number", "minimum": 0}`)
+		`{"type": "number", "exclusiveMinimum": 0}`)
+	requireConvertedJSON(t,
+		`{"type": "number", "maximum": 5, "exclusiveMaximum": false}`,
+		`{"type": "number", "maximum": 5}`)
+	// A draft-3 "required": true on a property moves into the parent's
+	// required list, keeping existing names and listing added ones in order.
+	requireConvertedJSON(t,
+		`{"type": "object", "required": ["z"], "properties": {"b": {"type": "string", "required": true}, "a": {"type": "integer", "required": true}, "o": {"type": "string", "required": false}}}`,
+		`{"type": "object", "required": ["z", "a", "b"], "properties": {"a": {"type": "integer"}, "b": {"type": "string"}, "o": {"type": "string"}}}`)
 }
 
 func TestConvertMCPSchema_ConstantWholeNumberTypesAsInteger(t *testing.T) {
@@ -236,6 +244,20 @@ func TestNormalizeSchemaReportsChanges(t *testing.T) {
 	}, changes)
 	// The caller's map is unchanged.
 	require.Contains(t, input["properties"].(map[string]any)["mode"].(map[string]any), "oneOf")
+}
+
+func TestNormalizeSchemaReportsDraftForms(t *testing.T) {
+	input := map[string]any{
+		"type":             "object",
+		"properties":       map[string]any{"id": map[string]any{"type": "string", "required": true}},
+		"minimum":          3.0,
+		"exclusiveMinimum": true,
+	}
+	_, changes := tool.NormalizeSchema(input)
+	require.ElementsMatch(t, []tool.SchemaChange{
+		{Path: "properties.id", Kind: tool.SchemaChangeDraft, Keys: []string{"required", "type"}},
+		{Path: "", Kind: tool.SchemaChangeDraft, Keys: []string{"exclusiveMinimum", "minimum", "properties", "required", "type"}},
+	}, changes)
 }
 
 func TestConvertMCPSchema_BaselineSingleTypeJSON(t *testing.T) {
