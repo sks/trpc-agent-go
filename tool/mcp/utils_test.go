@@ -562,6 +562,23 @@ func TestConvertMCPSchema_AllOfMerged(t *testing.T) {
 	requireConvertedJSON(t,
 		`{"description": "own", "allOf": [{"description": "member", "type": "string"}]}`,
 		`{"type": "string", "description": "own"}`)
+
+	// A member's annotation fills in when the node has none of its own, and
+	// the first member that carries one supplies it.
+	requireConvertedJSON(t,
+		`{"allOf": [{"type": "string"}, {"description": "first", "default": "x"}, {"description": "second"}]}`,
+		`{"type": "string", "description": "first", "default": "x"}`)
+
+	// The same holds through a nested allOf, which merges first.
+	requireConvertedJSON(t, `{
+		"allOf": [
+			{"allOf": [
+				{"type": "string", "enum": ["a", "b"], "minLength": 1},
+				{"enum": ["b"], "maxLength": 3, "pattern": "x"}
+			]},
+			{"description": "d"}
+		]
+	}`, `{"type": "string", "description": "d", "pattern": "x", "minLength": 1, "maxLength": 3, "enum": ["b"]}`)
 }
 
 func TestConvertMCPSchema_MalformedKeywordsDropped(t *testing.T) {
