@@ -372,7 +372,11 @@ func (n *schemaNormalizer) mergeSchemaInto(dst map[string]any, path string, memb
 		case upperBoundKeyword[key]:
 			dst[key] = pickStricterNumber(dst[key], value, math.Min)
 		case annotationKeyword[key]:
-			// Two annotations never conflict; the node's own text wins.
+			// Two annotations never conflict: the node's own text wins, and
+			// a member's fills in when the node has none.
+			if _, exists := dst[key]; !exists {
+				dst[key] = value
+			}
 		default:
 			existing, exists := dst[key]
 			if !exists {
