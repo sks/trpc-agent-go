@@ -397,7 +397,7 @@ func (c *DefaultSeverityClassifier) classifyRedirect(assessment *SeverityAssessm
 	}
 
 	switch redir.Op {
-	case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.ClbOut:
+	case syntax.RdrOut, syntax.AppOut, syntax.RdrAll, syntax.AppAll, syntax.RdrClob:
 		if target == "/dev/null" || strings.HasPrefix(target, "&") {
 			return
 		}
