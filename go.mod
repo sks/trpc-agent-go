@@ -1,6 +1,6 @@
 module trpc.group/trpc-go/trpc-agent-go
 
-go 1.21
+go 1.26.0
 
 require (
 	connectrpc.com/connect v1.18.1
@@ -10,7 +10,7 @@ require (
 	github.com/go-ego/gse v1.0.0
 	github.com/gomutex/godocx v0.1.5
 	github.com/gonfva/docxlib v0.0.0-20210517191039-d8f39cecf1ad
-	github.com/google/go-cmp v0.6.0
+	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/mattn/go-sqlite3 v1.14.32
@@ -33,15 +33,18 @@ require (
 	go.opentelemetry.io/proto/otlp v1.3.1
 	go.uber.org/zap v1.27.0
 	golang.org/x/net v0.34.0
-	golang.org/x/sync v0.10.0
-	golang.org/x/sys v0.30.0
+	golang.org/x/sync v0.17.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.21.0
 	google.golang.org/grpc v1.65.0
 	google.golang.org/protobuf v1.34.2
 	gopkg.in/yaml.v3 v3.0.1
+	mvdan.cc/sh/v3 v3.14.1
 	trpc.group/trpc-go/trpc-a2a-go v0.2.6-0.20260721084546-18c8244d0acb
 	trpc.group/trpc-go/trpc-mcp-go v0.0.10
 )
+
+require github.com/hashicorp/golang-lru/v2 v2.0.7
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
@@ -75,7 +78,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/tidwall/gjson v1.14.4 // indirect
+	github.com/tidwall/gjson v1.14.4
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
