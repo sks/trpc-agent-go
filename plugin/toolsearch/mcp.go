@@ -10,9 +10,6 @@ package toolsearch
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -218,20 +215,10 @@ func (p *Plugin) ensureMCPListed(ctx context.Context, box *toolboxIndex) {
 }
 
 // declarationFingerprint hashes a declaration for change detection across
-// listings, so unchanged tools can keep cached embeddings. On marshal failure
-// it falls back to hashing the tool name so the return value always has the
-// same shape (hex-encoded sha256) and cannot accidentally equal a valid hash
-// from the happy path.
+// listings, so unchanged tools can keep cached embeddings. It uses the
+// canonical SHA-256 content hash over name + "\x00" + description + "\x00" + schema_json.
 func declarationFingerprint(decl *tool.Declaration) string {
-	if decl == nil {
-		return ""
-	}
-	data, err := json.Marshal(decl)
-	if err != nil {
-		data = []byte("name:" + decl.Name)
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return ComputeDeclarationContentHash(decl)
 }
 
 // materializeNamespace lists the MCP server backing a namespace, if any, so its

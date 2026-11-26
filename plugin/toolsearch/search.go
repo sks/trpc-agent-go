@@ -492,6 +492,34 @@ func (p *Plugin) searchToolsByQueries(namespace string, queries []string, maxRes
 		}
 	}
 
+	if cfg := p.effectiveAbstentionConfig(); cfg != nil {
+		scoredCandidates := make([]ScoredCandidate, 0, len(best))
+		for name, score := range best {
+			desc := ""
+			if meta := p.metaByName[name]; meta != nil {
+				desc = meta.Description
+			}
+			scoredCandidates = append(scoredCandidates, ScoredCandidate{
+				Name:        name,
+				Score:       float64(score),
+				Description: desc,
+			})
+		}
+		decided := ApplyAbstention(scoredCandidates, queries, cfg)
+		if len(decided) == 0 {
+			return nil, nil
+		}
+		allowedSet := make(map[string]struct{}, len(decided))
+		for _, c := range decided {
+			allowedSet[c.Name] = struct{}{}
+		}
+		for name := range best {
+			if _, ok := allowedSet[name]; !ok {
+				delete(best, name)
+			}
+		}
+	}
+
 	type candidate struct {
 		name     string
 		score    int

@@ -107,8 +107,10 @@ func usageTokens(v any) int {
 // store, enabling semantic keyword search from tool_search. Build one with
 // NewSemanticToolIndex and pass it to New via WithSemanticToolIndex.
 type SemanticToolIndex struct {
-	store    vectorstore.VectorStore
-	embedder embedder.Embedder
+	store      vectorstore.VectorStore
+	embedder   embedder.Embedder
+	cache      *EmbeddingCache
+	abstention *AbstentionConfig
 
 	// indexed maps a tool name to the fingerprint of its stored embedding.
 	// Keeping the fingerprint (not just a presence bit) lets upsert detect
@@ -142,6 +144,34 @@ func WithVectorStore(s vectorstore.VectorStore) SemanticToolIndexOption {
 	}
 }
 
+// WithEmbeddingCache sets a shared content-hash EmbeddingCache on the
+// SemanticToolIndex so repeated indexing or startup skips re-embedding tools
+// whose SHA-256 content hash over name + "\x00" + description + "\x00" + schema_json
+// is unchanged. By default a new EmbeddingCache is created automatically.
+func WithEmbeddingCache(c *EmbeddingCache) SemanticToolIndexOption {
+	return func(k *SemanticToolIndex) {
+		if c != nil {
+			k.cache = c
+		}
+	}
+}
+
+// WithSemanticAbstentionConfig sets the AbstentionConfig on the SemanticToolIndex.
+func WithSemanticAbstentionConfig(cfg AbstentionConfig) SemanticToolIndexOption {
+	return func(k *SemanticToolIndex) {
+		c := cfg
+		k.abstention = &c
+	}
+}
+
+// Cache returns the EmbeddingCache backing this SemanticToolIndex.
+func (k *SemanticToolIndex) Cache() *EmbeddingCache {
+	if k == nil {
+		return nil
+	}
+	return k.cache
+}
+
 // NewSemanticToolIndex creates a SemanticToolIndex backed by embedder e.
 func NewSemanticToolIndex(e embedder.Embedder, opts ...SemanticToolIndexOption) (*SemanticToolIndex, error) {
 	if e == nil {
@@ -150,6 +180,7 @@ func NewSemanticToolIndex(e embedder.Embedder, opts ...SemanticToolIndexOption) 
 	k := &SemanticToolIndex{
 		store:    inmemory.New(),
 		embedder: e,
+		cache:    NewEmbeddingCache(),
 		indexed:  make(map[string]string),
 	}
 	for _, opt := range opts {
@@ -186,11 +217,33 @@ func (k *SemanticToolIndex) upsert(
 			log.DebugfContext(ctx, "skip stale embed for tool %s", name)
 			continue
 		}
-		embedding, u, err := k.embedder.GetEmbeddingWithUsage(ctx, toolToText(ct.tool))
-		if err != nil {
-			return err
+		fp := ct.fingerprint
+		if fp == "" {
+			fp = ComputeToolContentHash(ct.tool)
 		}
-		addEmbedderUsage(usage, u)
+		var (
+			embedding []float64
+			cached    bool
+		)
+		if k.cache != nil {
+			embedding, cached = k.cache.Lookup(fp)
+		}
+		if !cached {
+			var (
+				u   map[string]any
+				err error
+			)
+			embedding, u, err = k.embedder.GetEmbeddingWithUsage(ctx, toolToText(ct.tool))
+			if err != nil {
+				return err
+			}
+			addEmbedderUsage(usage, u)
+			if k.cache != nil {
+				k.cache.Store(name, fp, embedding)
+			}
+		} else if k.cache != nil {
+			k.cache.Store(name, fp, embedding)
+		}
 		if existed {
 			if derr := k.store.Delete(ctx, name); derr != nil {
 				log.DebugfContext(ctx, "drop stale embedded tool %s: %v", name, derr)
@@ -202,7 +255,7 @@ func (k *SemanticToolIndex) upsert(
 		if err := k.store.Add(ctx, &document.Document{ID: name}, embedding); err != nil {
 			return err
 		}
-		k.indexed[name] = ct.fingerprint
+		k.indexed[name] = fp
 	}
 	return nil
 }
@@ -223,6 +276,9 @@ func (k *SemanticToolIndex) forget(ctx context.Context, names []string) {
 			continue
 		}
 		delete(k.indexed, name)
+		if k.cache != nil {
+			k.cache.Invalidate(name)
+		}
 		if err := k.store.Delete(ctx, name); err != nil {
 			// Delete errors are typically "not found" for a store that lost
 			// state (e.g. a fresh in-memory store on restart); log and move on
@@ -232,16 +288,16 @@ func (k *SemanticToolIndex) forget(ctx context.Context, names []string) {
 	}
 }
 
-// searchNames embeds query and returns candidate tool names ordered by
-// descending vector similarity, scoped to candidateIDs. Token usage is folded
-// into usage.
-func (k *SemanticToolIndex) searchNames(
+// searchScored embeds query and returns candidate tools with their vector
+// similarity scores ordered by descending similarity, scoped to candidateIDs.
+// Token usage is folded into usage.
+func (k *SemanticToolIndex) searchScored(
 	ctx context.Context,
 	query string,
 	candidateIDs []string,
 	limit int,
 	usage *model.Usage,
-) ([]string, error) {
+) ([]ScoredCandidate, error) {
 	embedding, u, err := k.embedder.GetEmbeddingWithUsage(ctx, query)
 	if err != nil {
 		return nil, err
@@ -257,11 +313,35 @@ func (k *SemanticToolIndex) searchNames(
 	if err != nil {
 		return nil, err
 	}
-	names := make([]string, 0, len(results.Results))
+	scored := make([]ScoredCandidate, 0, len(results.Results))
 	for _, r := range results.Results {
 		if r != nil && r.Document != nil {
-			names = append(names, r.Document.ID)
+			scored = append(scored, ScoredCandidate{
+				Name:  r.Document.ID,
+				Score: r.Score,
+			})
 		}
+	}
+	return scored, nil
+}
+
+// searchNames embeds query and returns candidate tool names ordered by
+// descending vector similarity, scoped to candidateIDs. Token usage is folded
+// into usage.
+func (k *SemanticToolIndex) searchNames(
+	ctx context.Context,
+	query string,
+	candidateIDs []string,
+	limit int,
+	usage *model.Usage,
+) ([]string, error) {
+	scored, err := k.searchScored(ctx, query, candidateIDs, limit, usage)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(scored))
+	for _, s := range scored {
+		names = append(names, s.Name)
 	}
 	return names, nil
 }
@@ -348,22 +428,52 @@ func (p *Plugin) searchToolsByEmbedding(
 	// Fetch the full candidate pool per query (limit=len) so the merge, not a
 	// per-query cap, decides the final cut.
 	bestRank := make(map[string]int, len(candidateIDs))
+	bestScore := make(map[string]float64, len(candidateIDs))
 	for _, q := range req.queries {
 		if q = strings.TrimSpace(q); q == "" {
 			continue
 		}
-		names, serr := p.semanticIndex.searchNames(ctx, q, candidateIDs, len(candidateIDs), usage)
+		scored, serr := p.semanticIndex.searchScored(ctx, q, candidateIDs, len(candidateIDs), usage)
 		if serr != nil {
 			return nil, nil, "", fmt.Errorf("tool search: semantic search: %w", serr)
 		}
-		for rank, name := range names {
-			if cur, ok := bestRank[name]; !ok || rank < cur {
-				bestRank[name] = rank
+		for rank, s := range scored {
+			if cur, ok := bestRank[s.Name]; !ok || rank < cur {
+				bestRank[s.Name] = rank
+			}
+			if curScore, ok := bestScore[s.Name]; !ok || s.Score > curScore {
+				bestScore[s.Name] = s.Score
 			}
 		}
 	}
 	if len(bestRank) == 0 {
 		return nil, nil, "", nil
+	}
+
+	abstentionCfg := p.effectiveAbstentionConfig()
+	if abstentionCfg != nil {
+		candidates := make([]ScoredCandidate, 0, len(bestScore))
+		for name, score := range bestScore {
+			desc := ""
+			if ct, ok := candidateTools[name]; ok && ct.tool != nil && ct.tool.Declaration() != nil {
+				desc = ct.tool.Declaration().Description
+			}
+			candidates = append(candidates, ScoredCandidate{
+				Name:        name,
+				Score:       score,
+				Description: desc,
+			})
+		}
+		decided := ApplyAbstention(candidates, req.queries, abstentionCfg)
+		if len(decided) == 0 {
+			return nil, nil, "", nil
+		}
+		ranked := make([]string, 0, len(decided))
+		for _, c := range decided {
+			ranked = append(ranked, c.Name)
+		}
+		selected, overflow = splitByCap(ranked, req.maxResults)
+		return selected, overflow, "", nil
 	}
 
 	ranked := make([]string, 0, len(bestRank))
@@ -379,6 +489,18 @@ func (p *Plugin) searchToolsByEmbedding(
 
 	selected, overflow = splitByCap(ranked, req.maxResults)
 	return selected, overflow, "", nil
+}
+
+// effectiveAbstentionConfig returns the Plugin's abstentionConfig if set,
+// falling back to the SemanticToolIndex's abstention config.
+func (p *Plugin) effectiveAbstentionConfig() *AbstentionConfig {
+	if p.abstentionConfig != nil {
+		return p.abstentionConfig
+	}
+	if p.semanticIndex != nil && p.semanticIndex.abstention != nil {
+		return p.semanticIndex.abstention
+	}
+	return nil
 }
 
 // embeddingCandidates resolves candidate tools for an embedding search under

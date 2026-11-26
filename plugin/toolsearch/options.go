@@ -121,6 +121,10 @@ type options struct {
 	// back to the built-in keyword matching instead of returning an error to
 	// the model. It has no effect unless WithSemanticToolIndex is also set.
 	embeddingFailOpen bool
+	// abstentionConfig, when non-nil, applies minimum-confidence and score-gap
+	// abstention as well as optional two-stage family narrowing to tool_search
+	// query results.
+	abstentionConfig *AbstentionConfig
 }
 
 func newOptions(opts ...Option) *options {
@@ -251,6 +255,17 @@ func WithSemanticToolIndex(k *SemanticToolIndex) Option {
 // WithSemanticToolIndex is also set.
 func WithEmbeddingFailOpen() Option {
 	return func(o *options) { o.embeddingFailOpen = true }
+}
+
+// WithAbstentionConfig enables retrieve-then-decide abstention (MinScore,
+// MinScoreGap, RequireLexicalOverlap) and optional two-stage tool family
+// narrowing (TopFamilies) on tool_search queries so queries that do not match
+// any tool return 0 tools instead of top-K false positives.
+func WithAbstentionConfig(cfg AbstentionConfig) Option {
+	return func(o *options) {
+		c := cfg
+		o.abstentionConfig = &c
+	}
 }
 
 // trimNonEmpty trims whitespace from each entry and drops the empties.
