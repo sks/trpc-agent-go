@@ -525,6 +525,9 @@ type GenerationConfig struct {
 	// ThinkingLevel controls the qualitative thinking level for providers that support it.
 	// Gemini 3 uses this field for thinkingConfig.thinkingLevel.
 	ThinkingLevel *string `json:"thinking_level,omitempty"`
+
+	// PromptCacheKey is an optional stable key for provider-side prompt/KV cache routing.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
 }
 
 // GenerationConfigPatch selectively overrides fields in GenerationConfig.
@@ -551,6 +554,7 @@ type GenerationConfigPatch struct {
 	ThinkingEnabled  *bool    `json:"thinking_enabled,omitempty"`
 	ThinkingTokens   *int     `json:"thinking_tokens,omitempty"`
 	ThinkingLevel    *string  `json:"thinking_level,omitempty"`
+	PromptCacheKey   string   `json:"prompt_cache_key,omitempty"`
 }
 
 // ApplyGenerationConfigPatch applies patch to base and returns the merged
@@ -597,6 +601,9 @@ func ApplyGenerationConfigPatch(
 	}
 	if patch.ThinkingLevel != nil {
 		base.ThinkingLevel = patch.ThinkingLevel
+	}
+	if patch.PromptCacheKey != "" {
+		base.PromptCacheKey = patch.PromptCacheKey
 	}
 	return base
 }

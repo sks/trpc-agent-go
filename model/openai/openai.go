@@ -1019,6 +1019,9 @@ func (m *Model) buildChatRequestWithToolControl(
 		chatRequest.ReasoningEffort = shared.ReasoningEffort(*request.ReasoningEffort)
 	}
 	opts := m.buildThinkingOption(request)
+	if request.PromptCacheKey != "" {
+		opts = append(opts, openaiopt.WithJSONSet("prompt_cache_key", request.PromptCacheKey))
+	}
 	// Add model-level extra fields to the request.
 	for key, value := range imodelrequest.FilterToolControlFields(
 		m.extraFields,
