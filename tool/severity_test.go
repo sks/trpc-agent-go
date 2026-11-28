@@ -155,6 +155,110 @@ func TestDefaultSeverityClassifier_SQLAndPaths(t *testing.T) {
 	})
 }
 
+func TestSeverityAssessment_RaiseAndMerge(t *testing.T) {
+	var a SeverityAssessment
+	a.Raise(SeverityLow, RiskCategoryWrite, "local edit")
+	a.Raise(SeverityLow, RiskCategoryWrite, "local edit") // deduplicated
+	assert.Equal(t, SeverityLow, a.Level)
+	assert.Equal(t, RiskCategoryWrite, a.Category)
+	assert.Equal(t, []string{"local edit"}, a.Reasons)
+
+	other := SeverityAssessment{
+		Level:            SeverityCritical,
+		Category:         RiskCategoryDestructive,
+		Reasons:          []string{"protected path hit"},
+		ProtectedPathHit: true,
+	}.Finalize()
+	a.Merge(other)
+	assert.Equal(t, SeverityCritical, a.Level)
+	assert.Equal(t, RiskCategoryDestructive, a.Category)
+	assert.True(t, a.OneTimeApprovalOnly)
+	assert.True(t, a.ProtectedPathHit)
+	assert.Len(t, a.Reasons, 2)
+}
+
+func TestDefaultSeverityClassifier_HTTPAndPluggableAnalyzers(t *testing.T) {
+	ctx := context.Background()
+
+	// Custom Python snippet analyzer plugged in via ArgRiskAnalyzerFunc.
+	pythonAnalyzer := ArgRiskAnalyzerFunc(func(input SeverityInput, assessment *SeverityAssessment) {
+		if input.ToolName != "python_eval" {
+			return
+		}
+		code, _ := input.Args["code"].(string)
+		if code == "import shutil; shutil.rmtree('/')" {
+			assessment.Raise(SeverityCritical, RiskCategoryDestructive, "python rmtree('/') detected")
+		}
+	})
+
+	classifier := NewSeverityClassifier(
+		WithWorkspaceDir("/workspace/project"),
+		WithExtraProtectedGlobs("**/vault.token"),
+		WithArgAnalyzers(pythonAnalyzer),
+	)
+
+	t.Run("HTTP GET is read severity", func(t *testing.T) {
+		got, err := classifier.ClassifyToolCall(ctx, &PermissionRequest{
+			ToolName:  "http_request",
+			Arguments: []byte(`{"method": "GET", "url": "https://api.example.com/v1/items"}`),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, SeverityRead, got.Level)
+		assert.Equal(t, RiskCategoryRead, got.Category)
+	})
+
+	t.Run("HTTP DELETE is high destructive severity", func(t *testing.T) {
+		got, err := classifier.ClassifyToolCall(ctx, &PermissionRequest{
+			ToolName:  "http_request",
+			Arguments: []byte(`{"method": "DELETE", "url": "https://api.example.com/v1/items/42"}`),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, SeverityHigh, got.Level)
+		assert.Equal(t, RiskCategoryDestructive, got.Category)
+	})
+
+	t.Run("HTTP cloud metadata URL escalates to critical protected hit", func(t *testing.T) {
+		got, err := classifier.ClassifyToolCall(ctx, &PermissionRequest{
+			ToolName:  "http_request",
+			Arguments: []byte(`{"method": "GET", "url": "http://169.254.169.254/latest/meta-data/iam/"}`),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, SeverityCritical, got.Level)
+		assert.True(t, got.ProtectedPathHit)
+		assert.True(t, got.OneTimeApprovalOnly)
+	})
+
+	t.Run("custom ArgRiskAnalyzer escalates domain-specific tool call", func(t *testing.T) {
+		got, err := classifier.ClassifyToolCall(ctx, &PermissionRequest{
+			ToolName:  "python_eval",
+			Arguments: []byte(`{"code": "import shutil; shutil.rmtree('/')"}`),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, SeverityCritical, got.Level)
+		assert.Equal(t, RiskCategoryDestructive, got.Category)
+		assert.True(t, got.OneTimeApprovalOnly)
+	})
+
+	t.Run("custom CommandRiskAnalyzer overrides shell analyzer", func(t *testing.T) {
+		customShell := NewSeverityClassifier(
+			WithShellAnalyzer(CommandRiskAnalyzerFunc(func(command string) SeverityAssessment {
+				return SeverityAssessment{
+					Level:    SeverityHigh,
+					Category: RiskCategoryInstall,
+					Reasons:  []string{"custom shell policy: " + command},
+				}
+			})),
+		)
+		got, err := customShell.ClassifyToolCall(ctx, &PermissionRequest{
+			ToolName:  "run_shell",
+			Arguments: []byte(`{"command": "echo hi"}`),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, SeverityHigh, got.Level)
+		assert.Equal(t, RiskCategoryInstall, got.Category)
+	})
+}
+
 func mustJSONQuote(s string) string {
 	b, _ := parseOrQuote(s)
 	return b

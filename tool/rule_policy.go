@@ -16,32 +16,45 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 )
 
-// RuleEffect specifies the policy action of a matching ToolRule.
-type RuleEffect string
+// RuleAction specifies the policy action of a matching PermissionRule.
+type RuleAction string
+
+// RuleEffect is an alias for RuleAction for backward compatibility.
+type RuleEffect = RuleAction
 
 const (
-	// RuleEffectAllow permits the tool to be advertised, searched, and executed (subject to severity tier).
-	RuleEffectAllow RuleEffect = "allow"
-	// RuleEffectDeny blocks the tool across wire schemas, tool_search, and execution.
-	RuleEffectDeny RuleEffect = "deny"
-	// RuleEffectHide omits the tool from initial wire schemas while keeping it callable (e.g. via call_tool).
-	RuleEffectHide RuleEffect = "hide"
-	// RuleEffectRequireApproval forces a permission ask before execution regardless of autonomy tier.
-	RuleEffectRequireApproval RuleEffect = "require_approval"
-	// RuleEffectAutoApprove waives approval prompts for matching non-critical tool calls.
-	RuleEffectAutoApprove RuleEffect = "auto_approve"
+	// RuleActionAllow permits the tool to be advertised, searched, and executed (subject to severity tier).
+	RuleActionAllow RuleAction = "allow"
+	// RuleActionDeny blocks the tool across wire schemas, tool_search, and execution.
+	RuleActionDeny RuleAction = "deny"
+	// RuleActionHide omits the tool from initial wire schemas while keeping it callable (e.g. via call_tool).
+	RuleActionHide RuleAction = "hide"
+	// RuleActionRequireApproval forces a permission ask before execution regardless of autonomy tier.
+	RuleActionRequireApproval RuleAction = "require_approval"
+	// RuleActionAutoApprove waives approval prompts for matching non-critical tool calls.
+	RuleActionAutoApprove RuleAction = "auto_approve"
+
+	// Backward-compatible RuleEffect constant aliases.
+	RuleEffectAllow           = RuleActionAllow
+	RuleEffectDeny            = RuleActionDeny
+	RuleEffectHide            = RuleActionHide
+	RuleEffectRequireApproval = RuleActionRequireApproval
+	RuleEffectAutoApprove     = RuleActionAutoApprove
 )
 
-// AutonomyLevel configures the baseline severity gate for a session or agent.
-type AutonomyLevel string
+// AutonomyMode configures the baseline severity gate for a session or agent.
+type AutonomyMode string
+
+// AutonomyLevel is an alias for AutonomyMode for backward compatibility.
+type AutonomyLevel = AutonomyMode
 
 const (
 	// AutonomyReadOnly allows SeverityRead and denies all mutating calls (SeverityLow..Critical).
-	AutonomyReadOnly AutonomyLevel = "readonly"
+	AutonomyReadOnly AutonomyMode = "readonly"
 	// AutonomySupervised auto-approves SeverityRead and SeverityLow, prompts for Medium/High, and forces one-time prompt for Critical.
-	AutonomySupervised AutonomyLevel = "supervised"
+	AutonomySupervised AutonomyMode = "supervised"
 	// AutonomyFull auto-approves SeverityRead..Medium, prompts for High/Critical.
-	AutonomyFull AutonomyLevel = "full"
+	AutonomyFull AutonomyMode = "full"
 )
 
 // RuleLayer identifies which policy tier a rule belongs to.
@@ -56,7 +69,7 @@ const (
 	RuleLayerSubAgent RuleLayer = "subagent"
 )
 
-// ToolRuleMatch defines glob and severity match predicates for a ToolRule.
+// ToolRuleMatch defines glob and severity match predicates for a PermissionRule.
 type ToolRuleMatch struct {
 	// Name matches the tool name using case-insensitive glob syntax (e.g. "mcp__github__*", "gmail_*").
 	Name string `json:"name,omitempty" yaml:"name,omitempty" toml:"name,omitempty"`
@@ -66,6 +79,34 @@ type ToolRuleMatch struct {
 	Category RiskCategory `json:"category,omitempty" yaml:"category,omitempty" toml:"category,omitempty"`
 	// MinSeverity matches when the computed SeverityLevel is >= MinSeverity.
 	MinSeverity *SeverityLevel `json:"min_severity,omitempty" yaml:"min_severity,omitempty" toml:"min_severity,omitempty"`
+}
+
+// MatchesNameAndFamily reports whether toolName satisfies the Name and Family predicates.
+func (m ToolRuleMatch) MatchesNameAndFamily(toolName string) bool {
+	if m.Name != "" && !globMatchFold(m.Name, toolName) {
+		return false
+	}
+	if m.Family != "" {
+		family := toolFamilyOf(toolName)
+		if !globMatchFold(m.Family, family) {
+			return false
+		}
+	}
+	return true
+}
+
+// Matches reports whether toolName and assessment satisfy all predicates on m.
+func (m ToolRuleMatch) Matches(toolName string, assessment SeverityAssessment) bool {
+	if !m.MatchesNameAndFamily(toolName) {
+		return false
+	}
+	if m.Category != "" && !strings.EqualFold(string(m.Category), string(assessment.Category)) {
+		return false
+	}
+	if m.MinSeverity != nil && assessment.Level < *m.MinSeverity {
+		return false
+	}
+	return true
 }
 
 // ToolRuleWhen restricts a rule to a specific runtime context.
@@ -78,14 +119,77 @@ type ToolRuleWhen struct {
 	Origin string `json:"origin,omitempty" yaml:"origin,omitempty" toml:"origin,omitempty"`
 }
 
-// ToolRule is one declarative tool governance rule.
-type ToolRule struct {
+// Matches reports whether rc satisfies the contextual constraints in w.
+func (w *ToolRuleWhen) Matches(rc RuleRuntimeContext) bool {
+	if w == nil {
+		return true
+	}
+	if w.Channel != "" && !globMatchFold(w.Channel, rc.Channel) {
+		return false
+	}
+	if w.Agent != "" && !globMatchFold(w.Agent, rc.Agent) {
+		return false
+	}
+	if w.Origin != "" && !globMatchFold(w.Origin, rc.Origin) {
+		return false
+	}
+	return true
+}
+
+// PermissionRule is one declarative tool governance rule.
+type PermissionRule struct {
 	ID     string         `json:"id,omitempty" yaml:"id,omitempty" toml:"id,omitempty"`
-	Effect RuleEffect     `json:"effect" yaml:"effect" toml:"effect"`
+	Effect RuleAction     `json:"effect" yaml:"effect" toml:"effect"`
 	Match  ToolRuleMatch  `json:"match" yaml:"match" toml:"match"`
 	Except *ToolRuleMatch `json:"except,omitempty" yaml:"except,omitempty" toml:"except,omitempty"`
 	When   *ToolRuleWhen  `json:"when,omitempty" yaml:"when,omitempty" toml:"when,omitempty"`
 	Reason string         `json:"reason,omitempty" yaml:"reason,omitempty" toml:"reason,omitempty"`
+}
+
+// ToolRule is an alias for PermissionRule for backward compatibility.
+type ToolRule = PermissionRule
+
+// MatchesNameOnly reports whether r matches toolName and rc without runtime severity predicates.
+func (r PermissionRule) MatchesNameOnly(toolName string, rc RuleRuntimeContext) bool {
+	if r.Match.Category != "" || r.Match.MinSeverity != nil {
+		return false
+	}
+	if !r.When.Matches(rc) {
+		return false
+	}
+	if !r.Match.MatchesNameAndFamily(toolName) {
+		return false
+	}
+	if r.Except != nil && r.Except.MatchesNameAndFamily(toolName) {
+		return false
+	}
+	return true
+}
+
+// MatchesFull reports whether r matches toolName, assessment, and rc.
+func (r PermissionRule) MatchesFull(toolName string, assessment SeverityAssessment, rc RuleRuntimeContext) bool {
+	if !r.When.Matches(rc) {
+		return false
+	}
+	if !r.Match.Matches(toolName, assessment) {
+		return false
+	}
+	if r.Except != nil && r.Except.Matches(toolName, assessment) {
+		return false
+	}
+	return true
+}
+
+// FormatReason formats a structured human-readable explanation tagged with layer and rule ID.
+func (r PermissionRule) FormatReason(layer RuleLayer, fallback string) string {
+	base := strings.TrimSpace(r.Reason)
+	if base == "" {
+		base = fallback
+	}
+	if r.ID != "" {
+		return fmt.Sprintf("[%s:%s] %s", layer, r.ID, base)
+	}
+	return fmt.Sprintf("[%s] %s", layer, base)
 }
 
 // RuleRuntimeContext supplies caller context (channel, agent, origin) during rule evaluation.
@@ -114,30 +218,107 @@ func RuleRuntimeContextFrom(ctx context.Context) RuleRuntimeContext {
 	return rc
 }
 
-// RuleLayerSet holds the rules belonging to one RuleLayer.
-type RuleLayerSet struct {
+// PermissionRuleSet holds the rules belonging to one RuleLayer.
+type PermissionRuleSet struct {
 	Layer RuleLayer
-	Rules []ToolRule
+	Rules []PermissionRule
 }
 
-// RuleEvaluationResult describes the outcome of evaluating the 3-layer rule stack and severity gate.
-type RuleEvaluationResult struct {
+// RuleLayerSet is an alias for PermissionRuleSet for backward compatibility.
+type RuleLayerSet = PermissionRuleSet
+
+// EvaluateNameOnly evaluates static wire/search visibility rules in s.
+func (s PermissionRuleSet) EvaluateNameOnly(toolName string, rc RuleRuntimeContext) (RuleAction, PermissionRule) {
+	var matchedEffect RuleAction
+	var matchedRule PermissionRule
+	for _, rule := range s.Rules {
+		if !rule.MatchesNameOnly(toolName, rc) {
+			continue
+		}
+		if rule.Effect == RuleActionDeny {
+			return RuleActionDeny, rule
+		}
+		if rule.Effect == RuleActionHide && matchedEffect == "" {
+			matchedEffect = RuleActionHide
+			matchedRule = rule
+		}
+	}
+	return matchedEffect, matchedRule
+}
+
+// Evaluate evaluates runtime execution rules in s with precedence:
+// deny > require_approval > auto_approve > hide > allow.
+func (s PermissionRuleSet) Evaluate(toolName string, assessment SeverityAssessment, rc RuleRuntimeContext) (RuleAction, PermissionRule) {
+	var bestEffect RuleAction
+	var bestRule PermissionRule
+	for _, rule := range s.Rules {
+		if !rule.MatchesFull(toolName, assessment, rc) {
+			continue
+		}
+		switch rule.Effect {
+		case RuleActionDeny:
+			return RuleActionDeny, rule
+		case RuleActionRequireApproval:
+			bestEffect = RuleActionRequireApproval
+			bestRule = rule
+		case RuleActionAutoApprove:
+			if bestEffect != RuleActionRequireApproval {
+				bestEffect = RuleActionAutoApprove
+				bestRule = rule
+			}
+		}
+	}
+	return bestEffect, bestRule
+}
+
+// RuleEvaluationInput encapsulates the request and runtime scope evaluated by a RuleEvaluator.
+type RuleEvaluationInput struct {
+	Request        *PermissionRequest
+	RuntimeContext RuleRuntimeContext
+}
+
+// NewRuleEvaluationInput constructs a RuleEvaluationInput from ctx and req.
+func NewRuleEvaluationInput(ctx context.Context, req *PermissionRequest) RuleEvaluationInput {
+	return RuleEvaluationInput{
+		Request:        req,
+		RuntimeContext: RuleRuntimeContextFrom(ctx),
+	}
+}
+
+// RuleDecision describes the outcome of evaluating the 3-layer rule stack and severity gate.
+type RuleDecision struct {
 	Decision   PermissionDecision
-	Effect     RuleEffect
+	Effect     RuleAction
 	RuleID     string
 	Layer      RuleLayer
 	Assessment SeverityAssessment
 }
 
+// RuleEvaluationResult is an alias for RuleDecision for backward compatibility.
+type RuleEvaluationResult = RuleDecision
+
+// RuleEvaluator evaluates layered permission rules, wire visibility, and searchability.
+type RuleEvaluator interface {
+	Evaluate(ctx context.Context, req *PermissionRequest) (RuleDecision, error)
+	EvaluateInput(ctx context.Context, input RuleEvaluationInput) (RuleDecision, error)
+	IsVisibleOnWire(ctx context.Context, toolName string) bool
+	IsSearchable(ctx context.Context, toolName string) bool
+}
+
+var (
+	_ PermissionPolicy = (*RulePermissionPolicy)(nil)
+	_ RuleEvaluator    = (*RulePermissionPolicy)(nil)
+)
+
 // RulePermissionPolicy evaluates 3-layer declarative tool rules plus severity-based autonomy gating.
 type RulePermissionPolicy struct {
-	Autonomy   AutonomyLevel
+	Autonomy   AutonomyMode
 	Classifier SeverityClassifier
-	Layers     []RuleLayerSet
+	Layers     []PermissionRuleSet
 }
 
 // NewRulePermissionPolicy creates a RulePermissionPolicy for the given autonomy tier, classifier, and rule layers.
-func NewRulePermissionPolicy(autonomy AutonomyLevel, classifier SeverityClassifier, layers ...RuleLayerSet) *RulePermissionPolicy {
+func NewRulePermissionPolicy(autonomy AutonomyMode, classifier SeverityClassifier, layers ...PermissionRuleSet) *RulePermissionPolicy {
 	if autonomy == "" {
 		autonomy = AutonomySupervised
 	}
@@ -151,23 +332,23 @@ func NewRulePermissionPolicy(autonomy AutonomyLevel, classifier SeverityClassifi
 	}
 }
 
-// ForSubAgent derives a child RulePermissionPolicy that retains the Operator layer
+// ForSubAgent projects a child RulePermissionPolicy that retains the Operator layer
 // and replaces the Archetype layer with the sub-agent's own rule layer.
-func (p *RulePermissionPolicy) ForSubAgent(subAgentRules []ToolRule) *RulePermissionPolicy {
+func (p *RulePermissionPolicy) ForSubAgent(subAgentRules []PermissionRule) *RulePermissionPolicy {
 	if p == nil {
-		return NewRulePermissionPolicy(AutonomySupervised, nil, RuleLayerSet{
+		return NewRulePermissionPolicy(AutonomySupervised, nil, PermissionRuleSet{
 			Layer: RuleLayerSubAgent,
 			Rules: subAgentRules,
 		})
 	}
-	var nextLayers []RuleLayerSet
+	var nextLayers []PermissionRuleSet
 	for _, layer := range p.Layers {
 		if layer.Layer == RuleLayerOperator {
 			nextLayers = append(nextLayers, layer)
 		}
 	}
 	if len(subAgentRules) > 0 {
-		nextLayers = append(nextLayers, RuleLayerSet{
+		nextLayers = append(nextLayers, PermissionRuleSet{
 			Layer: RuleLayerSubAgent,
 			Rules: subAgentRules,
 		})
@@ -187,8 +368,8 @@ func (p *RulePermissionPolicy) IsVisibleOnWire(ctx context.Context, toolName str
 	}
 	rc := RuleRuntimeContextFrom(ctx)
 	for _, layer := range p.Layers {
-		effect, _ := evaluateLayerNameOnly(layer, toolName, rc)
-		if effect == RuleEffectDeny || effect == RuleEffectHide {
+		effect, _ := layer.EvaluateNameOnly(toolName, rc)
+		if effect == RuleActionDeny || effect == RuleActionHide {
 			return false
 		}
 	}
@@ -203,21 +384,32 @@ func (p *RulePermissionPolicy) IsSearchable(ctx context.Context, toolName string
 	}
 	rc := RuleRuntimeContextFrom(ctx)
 	for _, layer := range p.Layers {
-		effect, _ := evaluateLayerNameOnly(layer, toolName, rc)
-		if effect == RuleEffectDeny {
+		effect, _ := layer.EvaluateNameOnly(toolName, rc)
+		if effect == RuleActionDeny {
 			return false
 		}
 	}
 	return true
 }
 
-// Evaluate runs full rule + severity evaluation and returns the detailed RuleEvaluationResult.
-func (p *RulePermissionPolicy) Evaluate(ctx context.Context, req *PermissionRequest) (RuleEvaluationResult, error) {
-	if p == nil || req == nil {
-		return RuleEvaluationResult{
+// Evaluate runs full rule + severity evaluation for req using the runtime context in ctx.
+func (p *RulePermissionPolicy) Evaluate(ctx context.Context, req *PermissionRequest) (RuleDecision, error) {
+	return p.EvaluateInput(ctx, NewRuleEvaluationInput(ctx, req))
+}
+
+// EvaluateInput runs full rule + severity evaluation for an explicit RuleEvaluationInput.
+func (p *RulePermissionPolicy) EvaluateInput(ctx context.Context, input RuleEvaluationInput) (RuleDecision, error) {
+	if p == nil || input.Request == nil {
+		return RuleDecision{
 			Decision: AllowPermission(),
-			Effect:   RuleEffectAllow,
+			Effect:   RuleActionAllow,
 		}, nil
+	}
+
+	req := input.Request
+	rc := input.RuntimeContext
+	if rc == (RuleRuntimeContext{}) {
+		rc = RuleRuntimeContextFrom(ctx)
 	}
 
 	classifier := p.Classifier
@@ -226,10 +418,9 @@ func (p *RulePermissionPolicy) Evaluate(ctx context.Context, req *PermissionRequ
 	}
 	assessment, err := classifier.ClassifyToolCall(ctx, req)
 	if err != nil {
-		return RuleEvaluationResult{}, err
+		return RuleDecision{}, err
 	}
 
-	rc := RuleRuntimeContextFrom(ctx)
 	// Escalate severity for untrusted external triggers.
 	if strings.EqualFold(rc.Origin, "external_trigger") && assessment.Level > SeverityRead && assessment.Level < SeverityCritical {
 		assessment.Level++
@@ -239,59 +430,59 @@ func (p *RulePermissionPolicy) Evaluate(ctx context.Context, req *PermissionRequ
 	// Protected-path floor cannot be overridden by auto_approve rules.
 	if assessment.ProtectedPathHit {
 		reason := fmt.Sprintf("[operator:protected-path-floor] blocked by protected-path floor (%s)", strings.Join(assessment.Reasons, "; "))
-		return RuleEvaluationResult{
+		return RuleDecision{
 			Decision:   DenyPermission(reason),
-			Effect:     RuleEffectDeny,
+			Effect:     RuleActionDeny,
 			RuleID:     "protected-path-floor",
 			Layer:      RuleLayerOperator,
 			Assessment: assessment,
 		}, nil
 	}
 
-	var winningEffect RuleEffect
-	var winningRule ToolRule
+	var winningEffect RuleAction
+	var winningRule PermissionRule
 	var winningLayer RuleLayer
 
 	for _, layer := range p.Layers {
-		effect, rule := evaluateLayerFull(layer, req.ToolName, assessment, rc)
-		if effect == RuleEffectDeny {
-			reason := formatRuleReason(rule, layer.Layer, "denied by tool rule")
-			return RuleEvaluationResult{
+		effect, rule := layer.Evaluate(req.ToolName, assessment, rc)
+		if effect == RuleActionDeny {
+			reason := rule.FormatReason(layer.Layer, "denied by tool rule")
+			return RuleDecision{
 				Decision:   DenyPermission(reason),
-				Effect:     RuleEffectDeny,
+				Effect:     RuleActionDeny,
 				RuleID:     rule.ID,
 				Layer:      layer.Layer,
 				Assessment: assessment,
 			}, nil
 		}
-		if effect == RuleEffectRequireApproval {
-			winningEffect = RuleEffectRequireApproval
+		if effect == RuleActionRequireApproval {
+			winningEffect = RuleActionRequireApproval
 			winningRule = rule
 			winningLayer = layer.Layer
 		}
-		if effect == RuleEffectAutoApprove && winningEffect != RuleEffectRequireApproval && !assessment.OneTimeApprovalOnly {
-			winningEffect = RuleEffectAutoApprove
+		if effect == RuleActionAutoApprove && winningEffect != RuleActionRequireApproval && !assessment.OneTimeApprovalOnly {
+			winningEffect = RuleActionAutoApprove
 			winningRule = rule
 			winningLayer = layer.Layer
 		}
 	}
 
-	if winningEffect == RuleEffectRequireApproval {
-		reason := formatRuleReason(winningRule, winningLayer,
+	if winningEffect == RuleActionRequireApproval {
+		reason := winningRule.FormatReason(winningLayer,
 			fmt.Sprintf("approval required by rule (severity=%s)", assessment.Level))
-		return RuleEvaluationResult{
+		return RuleDecision{
 			Decision:   AskPermission(reason),
-			Effect:     RuleEffectRequireApproval,
+			Effect:     RuleActionRequireApproval,
 			RuleID:     winningRule.ID,
 			Layer:      winningLayer,
 			Assessment: assessment,
 		}, nil
 	}
 
-	if winningEffect == RuleEffectAutoApprove {
-		return RuleEvaluationResult{
+	if winningEffect == RuleActionAutoApprove {
+		return RuleDecision{
 			Decision:   AllowPermission(),
-			Effect:     RuleEffectAutoApprove,
+			Effect:     RuleActionAutoApprove,
 			RuleID:     winningRule.ID,
 			Layer:      winningLayer,
 			Assessment: assessment,
@@ -310,159 +501,60 @@ func (p *RulePermissionPolicy) CheckToolPermission(ctx context.Context, req *Per
 	return res.Decision, nil
 }
 
-func (p *RulePermissionPolicy) evaluateAutonomyMatrix(assessment SeverityAssessment) RuleEvaluationResult {
+func (p *RulePermissionPolicy) evaluateAutonomyMatrix(assessment SeverityAssessment) RuleDecision {
 	switch p.Autonomy {
 	case AutonomyReadOnly:
 		if assessment.Level == SeverityRead {
-			return RuleEvaluationResult{
+			return RuleDecision{
 				Decision:   AllowPermission(),
-				Effect:     RuleEffectAllow,
+				Effect:     RuleActionAllow,
 				Assessment: assessment,
 			}
 		}
-		return RuleEvaluationResult{
+		return RuleDecision{
 			Decision: DenyPermission(fmt.Sprintf(
 				"read-only autonomy mode blocks %s action (severity=%s: %s)",
 				assessment.Category, assessment.Level, strings.Join(assessment.Reasons, "; "))),
-			Effect:     RuleEffectDeny,
+			Effect:     RuleActionDeny,
 			RuleID:     "autonomy-readonly",
 			Layer:      RuleLayerOperator,
 			Assessment: assessment,
 		}
 	case AutonomyFull:
 		if assessment.Level <= SeverityMedium && !assessment.OneTimeApprovalOnly {
-			return RuleEvaluationResult{
+			return RuleDecision{
 				Decision:   AllowPermission(),
-				Effect:     RuleEffectAllow,
+				Effect:     RuleActionAllow,
 				Assessment: assessment,
 			}
 		}
-		return RuleEvaluationResult{
+		return RuleDecision{
 			Decision: AskPermission(fmt.Sprintf(
 				"approval required for %s tool call (severity=%s: %s)",
 				assessment.Category, assessment.Level, strings.Join(assessment.Reasons, "; "))),
-			Effect:     RuleEffectRequireApproval,
+			Effect:     RuleActionRequireApproval,
 			RuleID:     "autonomy-full-high-severity",
 			Layer:      RuleLayerOperator,
 			Assessment: assessment,
 		}
 	default: // AutonomySupervised
 		if assessment.Level <= SeverityLow && !assessment.OneTimeApprovalOnly {
-			return RuleEvaluationResult{
+			return RuleDecision{
 				Decision:   AllowPermission(),
-				Effect:     RuleEffectAllow,
+				Effect:     RuleActionAllow,
 				Assessment: assessment,
 			}
 		}
-		return RuleEvaluationResult{
+		return RuleDecision{
 			Decision: AskPermission(fmt.Sprintf(
 				"approval required for %s tool call (severity=%s: %s)",
 				assessment.Category, assessment.Level, strings.Join(assessment.Reasons, "; "))),
-			Effect:     RuleEffectRequireApproval,
+			Effect:     RuleActionRequireApproval,
 			RuleID:     "autonomy-supervised-severity-gate",
 			Layer:      RuleLayerOperator,
 			Assessment: assessment,
 		}
 	}
-}
-
-func evaluateLayerNameOnly(layer RuleLayerSet, toolName string, rc RuleRuntimeContext) (RuleEffect, ToolRule) {
-	var matchedEffect RuleEffect
-	var matchedRule ToolRule
-	for _, rule := range layer.Rules {
-		if rule.Match.Category != "" || rule.Match.MinSeverity != nil {
-			continue
-		}
-		if !ruleMatchesWhen(rule.When, rc) {
-			continue
-		}
-		if !matchNameAndFamily(rule.Match, toolName) {
-			continue
-		}
-		if rule.Except != nil && matchNameAndFamily(*rule.Except, toolName) {
-			continue
-		}
-		if rule.Effect == RuleEffectDeny {
-			return RuleEffectDeny, rule
-		}
-		if rule.Effect == RuleEffectHide && matchedEffect == "" {
-			matchedEffect = RuleEffectHide
-			matchedRule = rule
-		}
-	}
-	return matchedEffect, matchedRule
-}
-
-func evaluateLayerFull(layer RuleLayerSet, toolName string, assessment SeverityAssessment, rc RuleRuntimeContext) (RuleEffect, ToolRule) {
-	var bestEffect RuleEffect
-	var bestRule ToolRule
-	for _, rule := range layer.Rules {
-		if !ruleMatchesWhen(rule.When, rc) {
-			continue
-		}
-		if !matchRulePredicate(rule.Match, toolName, assessment) {
-			continue
-		}
-		if rule.Except != nil && matchRulePredicate(*rule.Except, toolName, assessment) {
-			continue
-		}
-		// Precedence inside a layer: deny > require_approval > auto_approve > hide > allow.
-		switch rule.Effect {
-		case RuleEffectDeny:
-			return RuleEffectDeny, rule
-		case RuleEffectRequireApproval:
-			bestEffect = RuleEffectRequireApproval
-			bestRule = rule
-		case RuleEffectAutoApprove:
-			if bestEffect != RuleEffectRequireApproval {
-				bestEffect = RuleEffectAutoApprove
-				bestRule = rule
-			}
-		}
-	}
-	return bestEffect, bestRule
-}
-
-func ruleMatchesWhen(when *ToolRuleWhen, rc RuleRuntimeContext) bool {
-	if when == nil {
-		return true
-	}
-	if when.Channel != "" && !globMatchFold(when.Channel, rc.Channel) {
-		return false
-	}
-	if when.Agent != "" && !globMatchFold(when.Agent, rc.Agent) {
-		return false
-	}
-	if when.Origin != "" && !globMatchFold(when.Origin, rc.Origin) {
-		return false
-	}
-	return true
-}
-
-func matchRulePredicate(m ToolRuleMatch, toolName string, assessment SeverityAssessment) bool {
-	if !matchNameAndFamily(m, toolName) {
-		return false
-	}
-	if m.Category != "" && !strings.EqualFold(string(m.Category), string(assessment.Category)) {
-		return false
-	}
-	if m.MinSeverity != nil && assessment.Level < *m.MinSeverity {
-		return false
-	}
-	return true
-}
-
-func matchNameAndFamily(m ToolRuleMatch, toolName string) bool {
-	if m.Name != "" && !globMatchFold(m.Name, toolName) {
-		return false
-	}
-	if m.Family != "" {
-		family := toolFamilyOf(toolName)
-		if !globMatchFold(m.Family, family) {
-			return false
-		}
-	}
-	return true
 }
 
 func toolFamilyOf(toolName string) string {
@@ -490,15 +582,4 @@ func globMatchFold(pattern, target string) bool {
 	}
 	ok, err := doublestar.Match(p, t)
 	return err == nil && ok
-}
-
-func formatRuleReason(rule ToolRule, layer RuleLayer, fallback string) string {
-	base := strings.TrimSpace(rule.Reason)
-	if base == "" {
-		base = fallback
-	}
-	if rule.ID != "" {
-		return fmt.Sprintf("[%s:%s] %s", layer, rule.ID, base)
-	}
-	return fmt.Sprintf("[%s] %s", layer, base)
 }

@@ -135,3 +135,44 @@ func TestRulePermissionPolicy_ThreeLayerAndSubAgentInheritance(t *testing.T) {
 	assert.Equal(t, PermissionActionDeny, protDec.Action)
 	assert.Contains(t, protDec.Reason, "protected-path-floor")
 }
+
+func TestRuleEvaluator_DDDValueObjectsAndCustomClassifier(t *testing.T) {
+	customClassifier := SeverityClassifierFunc(func(_ context.Context, req *PermissionRequest) (SeverityAssessment, error) {
+		if req.ToolName == "deploy_prod" {
+			return SeverityAssessment{
+				Level:    SeverityHigh,
+				Category: RiskCategoryWrite,
+				Reasons:  []string{"production deployment"},
+			}, nil
+		}
+		return SeverityAssessment{Level: SeverityRead, Category: RiskCategoryRead}, nil
+	})
+
+	minHigh := SeverityHigh
+	var evaluator RuleEvaluator = NewRulePermissionPolicy(
+		AutonomyFull,
+		customClassifier,
+		PermissionRuleSet{
+			Layer: RuleLayerOperator,
+			Rules: []PermissionRule{
+				{
+					ID:     "require-approval-high-prod",
+					Effect: RuleActionRequireApproval,
+					Match:  ToolRuleMatch{MinSeverity: &minHigh},
+					When:   &ToolRuleWhen{Channel: "slack"},
+					Reason: "High-severity actions from Slack require human confirmation.",
+				},
+			},
+		},
+	)
+
+	decision, err := evaluator.EvaluateInput(context.Background(), RuleEvaluationInput{
+		Request:        &PermissionRequest{ToolName: "deploy_prod"},
+		RuntimeContext: RuleRuntimeContext{Channel: "slack", Origin: "interactive_user"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, PermissionActionAsk, decision.Decision.Action)
+	assert.Equal(t, RuleActionRequireApproval, decision.Effect)
+	assert.Equal(t, "require-approval-high-prod", decision.RuleID)
+	assert.Contains(t, decision.Decision.Reason, "High-severity actions from Slack")
+}
