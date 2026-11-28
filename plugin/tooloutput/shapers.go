@@ -15,107 +15,142 @@ import (
 	"strings"
 )
 
-// ContentType identifies the detected structure of a tool output.
-type ContentType string
-
-const (
-	ContentJSON   ContentType = "json"
-	ContentDiff   ContentType = "diff"
-	ContentSearch ContentType = "search"
-	ContentCode   ContentType = "code"
-	ContentLog    ContentType = "log"
-)
-
 var (
 	searchLineRe = regexp.MustCompile(`^[^\s:][^:]*:\d+(:|$)`)
 	lockfileRe   = regexp.MustCompile(`(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Cargo\.lock|poetry\.lock|Gemfile\.lock|composer\.lock)$`)
+
+	defaultShaperRegistry = NewDefaultShaperRegistry()
+
+	_ ContentShaper = (*jsonOutputShaper)(nil)
+	_ ContentShaper = (*diffOutputShaper)(nil)
+	_ ContentShaper = (*searchOutputShaper)(nil)
+	_ ContentShaper = (*codeOutputShaper)(nil)
+	_ ContentShaper = (*logOutputShaper)(nil)
 )
 
-// DetectContentType deterministically classifies tool output.
-func DetectContentType(text string) ContentType {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return ContentLog
-	}
-	if (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && json.Valid([]byte(trimmed)) {
-		return ContentJSON
-	}
-	if strings.HasPrefix(trimmed, "diff --git ") ||
-		strings.Contains(trimmed, "\ndiff --git ") ||
-		(strings.Contains(trimmed, "\n--- ") && strings.Contains(trimmed, "\n+++ ") && strings.Contains(trimmed, "\n@@ ")) {
-		return ContentDiff
-	}
-
-	lines := strings.Split(trimmed, "\n")
-	nonEmpty := 0
-	searchMatches := 0
-	codeHints := 0
-	for i, line := range lines {
-		if i >= 60 {
-			break
-		}
-		l := strings.TrimSpace(line)
-		if l == "" {
-			continue
-		}
-		nonEmpty++
-		if searchLineRe.MatchString(l) {
-			searchMatches++
-		}
-		if strings.HasPrefix(l, "func ") || strings.HasPrefix(l, "package ") ||
-			strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "def ") ||
-			strings.HasPrefix(l, "class ") || strings.HasPrefix(l, "function ") ||
-			strings.HasSuffix(l, "{") || l == "}" {
-			codeHints++
-		}
-	}
-	if nonEmpty > 0 && searchMatches*2 >= nonEmpty {
-		return ContentSearch
-	}
-	if nonEmpty > 0 && codeHints*4 >= nonEmpty {
-		return ContentCode
-	}
-	return ContentLog
+// ShaperRegistry orders ContentShapers and selects the first matching shaper
+// for a given tool output payload.
+type ShaperRegistry struct {
+	shapers []ContentShaper
 }
 
-// Shape deterministically compacts text to fit within maxChars, optionally
-// prioritizing lines/items matching focus.
-func Shape(text string, maxChars int, focus string) (string, bool) {
-	if maxChars <= 0 {
-		maxChars = 6000
+// NewShaperRegistry constructs a ShaperRegistry from an ordered list of ContentShapers.
+func NewShaperRegistry(shapers ...ContentShaper) *ShaperRegistry {
+	reg := &ShaperRegistry{}
+	for _, s := range shapers {
+		if s != nil {
+			reg.shapers = append(reg.shapers, s)
+		}
 	}
-	if len(text) <= maxChars && strings.TrimSpace(focus) == "" {
-		return text, false
-	}
+	return reg
+}
 
-	var out string
-	switch DetectContentType(text) {
-	case ContentJSON:
-		out = shapeJSON(text, maxChars, focus)
-	case ContentDiff:
-		out = shapeDiff(text, maxChars, focus)
-	case ContentSearch:
-		out = shapeSearch(text, maxChars, focus)
-	case ContentCode:
-		out = shapeCode(text, maxChars, focus)
-	default:
-		out = shapeLog(text, maxChars, focus)
+// NewDefaultShaperRegistry constructs a ShaperRegistry with the built-in JSON,
+// diff, search, code, and fallback log shapers.
+func NewDefaultShaperRegistry() *ShaperRegistry {
+	return NewShaperRegistry(
+		&jsonOutputShaper{},
+		&diffOutputShaper{},
+		&searchOutputShaper{},
+		&codeOutputShaper{},
+		&logOutputShaper{},
+	)
+}
+
+// Register adds shaper ahead of any catch-all ContentLog shaper so custom
+// structured shapers take priority over unstructured log clamping.
+func (r *ShaperRegistry) Register(shaper ContentShaper) {
+	if r == nil || shaper == nil {
+		return
 	}
+	if len(r.shapers) > 0 && r.shapers[len(r.shapers)-1].ContentType() == ContentLog {
+		last := r.shapers[len(r.shapers)-1]
+		r.shapers[len(r.shapers)-1] = shaper
+		r.shapers = append(r.shapers, last)
+		return
+	}
+	r.shapers = append(r.shapers, shaper)
+}
+
+func (r *ShaperRegistry) match(text string) ContentShaper {
+	if strings.TrimSpace(text) == "" {
+		return &logOutputShaper{}
+	}
+	if r != nil {
+		for _, s := range r.shapers {
+			if s.CanShape(text) {
+				return s
+			}
+		}
+	}
+	return &logOutputShaper{}
+}
+
+// DetectContentType returns the ContentType of the first matching shaper.
+func (r *ShaperRegistry) DetectContentType(text string) ContentType {
+	return r.match(text).ContentType()
+}
+
+// ShapeResult deterministically compacts text to fit within maxChars, returning
+// the shaped text, detected ContentType, and whether compaction was applied.
+func (r *ShaperRegistry) ShapeResult(text string, maxChars int, focus string) ShapeResult {
+	if maxChars <= 0 {
+		maxChars = DefaultMaxChars
+	}
+	shaper := r.match(text)
+	if len(text) <= maxChars && strings.TrimSpace(focus) == "" {
+		return ShapeResult{
+			Content:     text,
+			ContentType: shaper.ContentType(),
+			Changed:     false,
+		}
+	}
+	out := shaper.Shape(text, maxChars, focus)
 	if len(out) > maxChars {
 		out = clampHeadTail(out, maxChars)
 	}
-	return out, true
+	return ShapeResult{
+		Content:     out,
+		ContentType: shaper.ContentType(),
+		Changed:     true,
+	}
 }
 
-func shapeJSON(text string, maxChars int, focus string) string {
+// Shape deterministically compacts text using r and returns (shaped, changed).
+func (r *ShaperRegistry) Shape(text string, maxChars int, focus string) (string, bool) {
+	res := r.ShapeResult(text, maxChars, focus)
+	return res.Content, res.Changed
+}
+
+// DetectContentType deterministically classifies tool output using the default ShaperRegistry.
+func DetectContentType(text string) ContentType {
+	return defaultShaperRegistry.DetectContentType(text)
+}
+
+// Shape deterministically compacts text to fit within maxChars using the default ShaperRegistry.
+func Shape(text string, maxChars int, focus string) (string, bool) {
+	return defaultShaperRegistry.Shape(text, maxChars, focus)
+}
+
+// jsonOutputShaper compacts JSON objects and arrays while preserving outliers and focused items.
+type jsonOutputShaper struct{}
+
+func (s *jsonOutputShaper) ContentType() ContentType { return ContentJSON }
+
+func (s *jsonOutputShaper) CanShape(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) && json.Valid([]byte(trimmed))
+}
+
+func (s *jsonOutputShaper) Shape(text string, maxChars int, focus string) string {
 	var parsed any
 	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
-		return shapeLog(text, maxChars, focus)
+		return (&logOutputShaper{}).Shape(text, maxChars, focus)
 	}
 	compacted := compactJSONValue(parsed, focus, 0)
 	b, err := json.MarshalIndent(compacted, "", "  ")
 	if err != nil {
-		return shapeLog(text, maxChars, focus)
+		return (&logOutputShaper{}).Shape(text, maxChars, focus)
 	}
 	if len(b) <= maxChars {
 		return string(b)
@@ -174,7 +209,19 @@ func isOutlierOrFocused(item any, focus string) bool {
 	return false
 }
 
-func shapeDiff(text string, maxChars int, focus string) string {
+// diffOutputShaper compacts unified git diffs by summarizing lockfiles and unfocused sections.
+type diffOutputShaper struct{}
+
+func (s *diffOutputShaper) ContentType() ContentType { return ContentDiff }
+
+func (s *diffOutputShaper) CanShape(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, "diff --git ") ||
+		strings.Contains(trimmed, "\ndiff --git ") ||
+		(strings.Contains(trimmed, "\n--- ") && strings.Contains(trimmed, "\n+++ ") && strings.Contains(trimmed, "\n@@ "))
+}
+
+func (s *diffOutputShaper) Shape(text string, maxChars int, focus string) string {
 	sections := strings.Split(text, "\ndiff --git ")
 	var b strings.Builder
 	for i, sec := range sections {
@@ -225,7 +272,32 @@ func countDiffLines(lines []string) (int, int) {
 	return added, removed
 }
 
-func shapeSearch(text string, maxChars int, focus string) string {
+// searchOutputShaper groups file:line search matches by file path.
+type searchOutputShaper struct{}
+
+func (s *searchOutputShaper) ContentType() ContentType { return ContentSearch }
+
+func (s *searchOutputShaper) CanShape(text string) bool {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	nonEmpty := 0
+	searchMatches := 0
+	for i, line := range lines {
+		if i >= 60 {
+			break
+		}
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		nonEmpty++
+		if searchLineRe.MatchString(l) {
+			searchMatches++
+		}
+	}
+	return nonEmpty > 0 && searchMatches*2 >= nonEmpty
+}
+
+func (s *searchOutputShaper) Shape(text string, maxChars int, focus string) string {
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	type group struct {
 		path  string
@@ -271,7 +343,35 @@ func shapeSearch(text string, maxChars int, focus string) string {
 	return b.String()
 }
 
-func shapeCode(text string, maxChars int, focus string) string {
+// codeOutputShaper collapses deeply nested brace blocks while preserving top-level declarations.
+type codeOutputShaper struct{}
+
+func (s *codeOutputShaper) ContentType() ContentType { return ContentCode }
+
+func (s *codeOutputShaper) CanShape(text string) bool {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	nonEmpty := 0
+	codeHints := 0
+	for i, line := range lines {
+		if i >= 60 {
+			break
+		}
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		nonEmpty++
+		if strings.HasPrefix(l, "func ") || strings.HasPrefix(l, "package ") ||
+			strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "def ") ||
+			strings.HasPrefix(l, "class ") || strings.HasPrefix(l, "function ") ||
+			strings.HasSuffix(l, "{") || l == "}" {
+			codeHints++
+		}
+	}
+	return nonEmpty > 0 && codeHints*4 >= nonEmpty
+}
+
+func (s *codeOutputShaper) Shape(text string, maxChars int, focus string) string {
 	lines := strings.Split(text, "\n")
 	var b strings.Builder
 	depth := 0
@@ -311,7 +411,14 @@ func shapeCode(text string, maxChars int, focus string) string {
 	return b.String()
 }
 
-func shapeLog(text string, maxChars int, focus string) string {
+// logOutputShaper is the fallback ContentShaper for unstructured logs and plain text.
+type logOutputShaper struct{}
+
+func (s *logOutputShaper) ContentType() ContentType { return ContentLog }
+
+func (s *logOutputShaper) CanShape(_ string) bool { return true }
+
+func (s *logOutputShaper) Shape(text string, maxChars int, focus string) string {
 	if focus != "" {
 		lines := strings.Split(text, "\n")
 		var matched []string

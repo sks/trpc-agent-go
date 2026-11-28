@@ -149,6 +149,68 @@ func TestPlugin_BeforeAndAfterTool(t *testing.T) {
 	require.Equal(t, 1, p.Store().Len())
 }
 
+type mapOutputStore struct {
+	entries map[string]string
+}
+
+func (m *mapOutputStore) Put(content string) string {
+	h := NewCCRHandle("custom-" + fmt.Sprintf("%d", len(m.entries)+1))
+	m.entries[h.Hash()] = content
+	return h.String()
+}
+
+func (m *mapOutputStore) Get(handleOrHash string) (string, bool) {
+	v, ok := m.entries[ParseHandle(handleOrHash)]
+	return v, ok
+}
+
+func (m *mapOutputStore) Len() int { return len(m.entries) }
+
+type csvCustomShaper struct{}
+
+func (s *csvCustomShaper) ContentType() ContentType { return ContentType("csv") }
+func (s *csvCustomShaper) CanShape(text string) bool {
+	return strings.HasPrefix(text, "col1,col2\n")
+}
+func (s *csvCustomShaper) Shape(text string, _ int, _ string) string {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	return fmt.Sprintf("csv header=%s rows=%d", lines[0], len(lines)-1)
+}
+
+func TestPlugin_WithCustomOutputStoreAndShaperRegistry(t *testing.T) {
+	customStore := &mapOutputStore{entries: make(map[string]string)}
+	reg := NewDefaultShaperRegistry()
+	reg.Register(&csvCustomShaper{})
+
+	p := New(
+		WithOutputStore(customStore),
+		WithShaperRegistry(reg),
+		WithThreshold(20),
+		WithMaxChars(28),
+	)
+	require.Nil(t, p.Store())
+	require.Equal(t, customStore, p.OutputStore())
+
+	csvPayload := "col1,col2\na,1\nb,2\nc,3\nd,4\ne,5\n"
+	afterRes, err := p.afterTool(context.Background(), &tool.AfterToolArgs{
+		ToolCallID: "call-csv",
+		ToolName:   "export_csv",
+		Result:     csvPayload,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, afterRes)
+	compacted := afterRes.CustomResult.(string)
+	require.Contains(t, compacted, "csv header=col1,col2 rows=5")
+	require.Contains(t, compacted, "⟦ccr:custom-1⟧")
+	require.Equal(t, 1, customStore.Len())
+
+	engine := NewQueryEngine(customStore)
+	slice, err := engine.RetrieveBytes("⟦ccr:custom-1⟧", 0, 9)
+	require.NoError(t, err)
+	require.Equal(t, "col1,col2", slice.Content)
+	require.True(t, slice.Truncated)
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.Marshal(v)

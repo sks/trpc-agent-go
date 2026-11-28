@@ -34,12 +34,14 @@ const (
 type Option func(*options)
 
 type options struct {
-	name       string
-	store      *CCRStore
-	threshold  int
-	maxChars   int
-	maxEntries int
-	ttl        time.Duration
+	name           string
+	outputStore    OutputStore
+	ccrStore       *CCRStore
+	shaperRegistry *ShaperRegistry
+	threshold      int
+	maxChars       int
+	maxEntries     int
+	ttl            time.Duration
 }
 
 // WithName sets the plugin name.
@@ -55,7 +57,31 @@ func WithName(name string) Option {
 func WithStore(store *CCRStore) Option {
 	return func(o *options) {
 		if store != nil {
-			o.store = store
+			o.ccrStore = store
+			o.outputStore = store
+		}
+	}
+}
+
+// WithOutputStore sets a custom OutputStore implementation.
+func WithOutputStore(store OutputStore) Option {
+	return func(o *options) {
+		if store != nil {
+			o.outputStore = store
+			if ccr, ok := store.(*CCRStore); ok {
+				o.ccrStore = ccr
+			} else {
+				o.ccrStore = nil
+			}
+		}
+	}
+}
+
+// WithShaperRegistry sets a custom ShaperRegistry for deterministic output shaping.
+func WithShaperRegistry(registry *ShaperRegistry) Option {
+	return func(o *options) {
+		if registry != nil {
+			o.shaperRegistry = registry
 		}
 	}
 }
@@ -98,12 +124,14 @@ func WithTTL(ttl time.Duration) Option {
 
 // Plugin is the tooloutput compaction plugin.
 type Plugin struct {
-	name      string
-	store     *CCRStore
-	threshold int
-	maxChars  int
-	focusMu   sync.Mutex
-	focusByID map[string]string
+	name        string
+	outputStore OutputStore
+	ccrStore    *CCRStore
+	shapers     *ShaperRegistry
+	threshold   int
+	maxChars    int
+	focusMu     sync.Mutex
+	focusByID   map[string]string
 }
 
 // New creates a new tooloutput compaction plugin.
@@ -120,16 +148,24 @@ func New(opts ...Option) *Plugin {
 			opt(&o)
 		}
 	}
-	store := o.store
-	if store == nil {
-		store = NewCCRStore(o.maxEntries, o.ttl)
+	outputStore := o.outputStore
+	ccrStore := o.ccrStore
+	if outputStore == nil {
+		ccrStore = NewCCRStore(o.maxEntries, o.ttl)
+		outputStore = ccrStore
+	}
+	shapers := o.shaperRegistry
+	if shapers == nil {
+		shapers = NewDefaultShaperRegistry()
 	}
 	return &Plugin{
-		name:      o.name,
-		store:     store,
-		threshold: o.threshold,
-		maxChars:  o.maxChars,
-		focusByID: make(map[string]string),
+		name:        o.name,
+		outputStore: outputStore,
+		ccrStore:    ccrStore,
+		shapers:     shapers,
+		threshold:   o.threshold,
+		maxChars:    o.maxChars,
+		focusByID:   make(map[string]string),
 	}
 }
 
@@ -141,12 +177,29 @@ func (p *Plugin) Name() string {
 	return p.name
 }
 
-// Store returns the underlying CCRStore.
+// Store returns the underlying CCRStore when backed by a CCRStore, or nil if a
+// custom non-CCR OutputStore was configured via WithOutputStore.
 func (p *Plugin) Store() *CCRStore {
 	if p == nil {
 		return nil
 	}
-	return p.store
+	return p.ccrStore
+}
+
+// OutputStore returns the OutputStore port configured on this plugin.
+func (p *Plugin) OutputStore() OutputStore {
+	if p == nil {
+		return nil
+	}
+	return p.outputStore
+}
+
+// ShaperRegistry returns the ShaperRegistry configured on this plugin.
+func (p *Plugin) ShaperRegistry() *ShaperRegistry {
+	if p == nil {
+		return nil
+	}
+	return p.shapers
 }
 
 // Tools returns the zero-LLM CCR inspection tools bound to this plugin's store.
@@ -154,7 +207,7 @@ func (p *Plugin) Tools() []tool.Tool {
 	if p == nil {
 		return nil
 	}
-	return NewTools(p.store)
+	return NewTools(p.outputStore)
 }
 
 // Register implements plugin.Plugin.
@@ -214,12 +267,16 @@ func (p *Plugin) afterTool(_ context.Context, args *tool.AfterToolArgs) (*tool.A
 		return nil, nil
 	}
 
-	shaped, changed := Shape(raw, p.maxChars, focus)
-	if !changed {
+	shapers := p.shapers
+	if shapers == nil {
+		shapers = defaultShaperRegistry
+	}
+	res := shapers.ShapeResult(raw, p.maxChars, focus)
+	if !res.Changed {
 		return nil, nil
 	}
-	handle := p.store.Put(raw)
-	compacted := fmt.Sprintf("%s\n\n[Full output stored in CCR: %s (%d chars). Use tool_result_retrieve or tool_result_query to inspect.]", shaped, handle, len(raw))
+	handle := p.outputStore.Put(raw)
+	compacted := fmt.Sprintf("%s\n\n[Full output stored in CCR: %s (%d chars). Use tool_result_retrieve or tool_result_query to inspect.]", res.Content, handle, len(raw))
 	return &tool.AfterToolResult{
 		CustomResult: compacted,
 	}, nil
