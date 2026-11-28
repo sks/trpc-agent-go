@@ -154,4 +154,20 @@ func TestSummarizeToolOutcome(t *testing.T) {
 		got := SummarizeToolOutcome("", "", false, "   ", 0)
 		assert.Equal(t, "[tool_outcome] tool=unknown id=none status=ok summary=ok", got)
 	})
+
+	t.Run("PackFormatter and OutcomeSummarizer interfaces work via structs and wrappers", func(t *testing.T) {
+		var formatter PackFormatter = NewEphemeralPackBuilder(128, 0)
+		ts := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+		entries := []*Entry{{
+			ID:        "mem-9",
+			UpdatedAt: ts,
+			Memory:    &Memory{Memory: "Prefers structured Go interfaces", Kind: KindFact},
+		}}
+		assert.Equal(t, formatter.BuildEntries(entries), BuildEphemeralPack(entries, 128, 0))
+
+		var summarizer OutcomeSummarizer = NewDefaultOutcomeSummarizer(40)
+		structured := summarizer.Summarize("git_status", "c-1", false, "clean working tree")
+		assert.Equal(t, "ok", structured.Status)
+		assert.Equal(t, structured.String(), summarizer.Format("git_status", "c-1", false, "clean working tree"))
+	})
 }

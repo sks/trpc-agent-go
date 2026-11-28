@@ -121,10 +121,10 @@ type options struct {
 	// back to the built-in keyword matching instead of returning an error to
 	// the model. It has no effect unless WithSemanticToolIndex is also set.
 	embeddingFailOpen bool
-	// abstentionConfig, when non-nil, applies minimum-confidence and score-gap
+	// abstentionDecider, when non-nil, applies minimum-confidence and score-gap
 	// abstention as well as optional two-stage family narrowing to tool_search
 	// query results.
-	abstentionConfig *AbstentionConfig
+	abstentionDecider AbstentionDecider
 }
 
 func newOptions(opts ...Option) *options {
@@ -264,7 +264,17 @@ func WithEmbeddingFailOpen() Option {
 func WithAbstentionConfig(cfg AbstentionConfig) Option {
 	return func(o *options) {
 		c := cfg
-		o.abstentionConfig = &c
+		o.abstentionDecider = &c
+	}
+}
+
+// WithAbstentionDecider sets a custom AbstentionDecider implementation for
+// retrieve-then-decide abstention on tool_search queries.
+func WithAbstentionDecider(decider AbstentionDecider) Option {
+	return func(o *options) {
+		if decider != nil {
+			o.abstentionDecider = decider
+		}
 	}
 }
 

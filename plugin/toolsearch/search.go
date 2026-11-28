@@ -492,7 +492,7 @@ func (p *Plugin) searchToolsByQueries(namespace string, queries []string, maxRes
 		}
 	}
 
-	if cfg := p.effectiveAbstentionConfig(); cfg != nil {
+	if decider := p.effectiveAbstentionDecider(); decider != nil {
 		scoredCandidates := make([]ScoredCandidate, 0, len(best))
 		for name, score := range best {
 			desc := ""
@@ -505,7 +505,7 @@ func (p *Plugin) searchToolsByQueries(namespace string, queries []string, maxRes
 				Description: desc,
 			})
 		}
-		decided := ApplyAbstention(scoredCandidates, queries, cfg)
+		decided := decider.ApplyAbstention(scoredCandidates, queries)
 		if len(decided) == 0 {
 			return nil, nil
 		}

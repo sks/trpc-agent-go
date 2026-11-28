@@ -222,3 +222,92 @@ func TestAbstention_KeywordPathAndTwoStageFamilyNarrowing(t *testing.T) {
 		assert.Equal(t, "mcp__github", ExtractToolFamily(toolSummary.Name))
 	}
 }
+
+type mapEmbeddingStore struct {
+	data map[string][]float64
+}
+
+func (m *mapEmbeddingStore) Get(hash string) ([]float64, bool) {
+	v, ok := m.data[hash]
+	return v, ok
+}
+
+func (m *mapEmbeddingStore) Put(hash string, vec []float64) {
+	cp := make([]float64, len(vec))
+	copy(cp, vec)
+	m.data[hash] = cp
+}
+
+func (m *mapEmbeddingStore) Len() int { return len(m.data) }
+
+type prefixFamilyExtractor struct{}
+
+func (prefixFamilyExtractor) ExtractFamily(toolName string) string {
+	if len(toolName) >= 3 {
+		return toolName[:3]
+	}
+	return toolName
+}
+
+func (e prefixFamilyExtractor) Narrow(candidates []ScoredCandidate, _ []string, topFamilies int) []ScoredCandidate {
+	if len(candidates) == 0 || topFamilies <= 0 {
+		return candidates
+	}
+	topFam := e.ExtractFamily(candidates[0].Name)
+	var out []ScoredCandidate
+	for _, c := range candidates {
+		if e.ExtractFamily(c.Name) == topFam {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func TestDDDInterfaces_EmbeddingStoreFamilyAndAbstention(t *testing.T) {
+	weather := newTestTool("get_weather", "weather forecast")
+	hasher := NewDeclarationHasher()
+	hash := hasher.ComputeToolContentHash(weather)
+	require.NotEmpty(t, hash)
+
+	customStore := &mapEmbeddingStore{data: make(map[string][]float64)}
+	emb := &cacheCountingEmbedder{
+		fakeEmbedder: fakeEmbedder{vectors: map[string][]float64{
+			"weather":           {1, 0, 0},
+			toolToText(weather): {1, 0, 0},
+		}},
+	}
+	idx, err := NewSemanticToolIndex(emb, WithVectorStore(inmemory.New()), WithEmbeddingStore(customStore))
+	require.NoError(t, err)
+	assert.Nil(t, idx.Cache())
+	assert.Equal(t, customStore, idx.EmbeddingStore())
+
+	cfg := AbstentionConfig{
+		MinScore:        0.5,
+		TopFamilies:     1,
+		FamilyExtractor: prefixFamilyExtractor{},
+	}
+	var decider AbstentionDecider = cfg
+	assert.True(t, decider.ShouldAbstain([]ScoredCandidate{{Name: "abc_one", Score: 0.2}}, []string{"abc"}))
+	assert.False(t, decider.ShouldAbstain([]ScoredCandidate{{Name: "abc_one", Score: 0.9}}, []string{"abc"}))
+
+	p := New(nil,
+		WithSemanticToolIndex(idx),
+		WithAbstentionDecider(decider),
+		WithToolboxes([]Toolbox{{Name: "u", Tools: []tool.Tool{weather}}}),
+	)
+	ctx, _ := ctxWithInvocation()
+	res := callSearch(t, ctx, p, toolSearchInput{Queries: []string{"weather"}, MaxResults: 1})
+	require.Len(t, res.Tools, 1)
+	assert.Equal(t, 1, customStore.Len())
+	_, ok := customStore.Get(hash)
+	assert.True(t, ok)
+
+	families := NewDefaultFamilyExtractor().RankFamilies([]ScoredCandidate{
+		{Name: "github_a", Score: 0.8},
+		{Name: "github_b", Score: 0.7},
+		{Name: "slack_a", Score: 0.6},
+	}, []string{"github"})
+	require.Len(t, families, 2)
+	assert.Equal(t, "github", families[0].Family)
+	assert.Len(t, families[0].Members, 2)
+}

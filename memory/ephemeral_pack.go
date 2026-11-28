@@ -31,8 +31,8 @@ const (
 	DefaultToolOutcomeSummaryMaxLen = 160
 )
 
-// MemoryCitation represents a single cited memory snippet inside an ephemeral
-// <memory-context> block.
+// MemoryCitation is a domain value object representing a single cited memory
+// snippet inside an ephemeral <memory-context> block.
 type MemoryCitation struct {
 	SourceID  string    `json:"source_id"`
 	Category  string    `json:"category"`
@@ -41,7 +41,7 @@ type MemoryCitation struct {
 	Snippet   string    `json:"snippet"`
 }
 
-// FormatCitation Tag renders the bracketed citation prefix `[source_id|category|updated_at]`.
+// FormatCitationTag renders the bracketed citation prefix `[source_id|category|updated_at]`.
 func (c MemoryCitation) FormatCitationTag() string {
 	sourceID := sanitizeSingleLine(c.SourceID)
 	if sourceID == "" {
@@ -89,6 +89,47 @@ func CitationFromEntry(entry *Entry) (MemoryCitation, bool) {
 		Snippet:   snippet,
 	}, true
 }
+
+// ToolOutcomeSummary is a domain value object holding structured metadata for a
+// 1-line argument-free tool outcome summary suitable for episodic or session memory.
+type ToolOutcomeSummary struct {
+	ToolName string `json:"tool_name"`
+	CallID   string `json:"call_id"`
+	Status   string `json:"status"`
+	Summary  string `json:"summary"`
+}
+
+// String renders the 1-line argument-free tool outcome summary:
+// `[tool_outcome] tool=<name> id=<callID> status=<ok|error> summary=...`
+func (t ToolOutcomeSummary) String() string {
+	name := sanitizeToken(t.ToolName, "unknown")
+	id := sanitizeToken(t.CallID, "none")
+	status := sanitizeToken(t.Status, "ok")
+	summary := sanitizeSingleLine(t.Summary)
+	if summary == "" {
+		summary = status
+	}
+	return fmt.Sprintf("[tool_outcome] tool=%s id=%s status=%s summary=%s", name, id, status, summary)
+}
+
+// PackFormatter renders recalled memory citations or entries into an ephemeral
+// context block without mutating static system prompts.
+type PackFormatter interface {
+	Build(citations []MemoryCitation) string
+	BuildEntries(entries []*Entry) string
+}
+
+// OutcomeSummarizer condenses a tool execution outcome into a single-line,
+// argument-free summary suitable for episodic or session memory.
+type OutcomeSummarizer interface {
+	Summarize(toolName, callID string, isError bool, rawPreview string) ToolOutcomeSummary
+	Format(toolName, callID string, isError bool, rawPreview string) string
+}
+
+var (
+	_ PackFormatter     = (*EphemeralPackBuilder)(nil)
+	_ OutcomeSummarizer = (*DefaultOutcomeSummarizer)(nil)
+)
 
 // EphemeralPackBuilder assembles recalled memory citations into a token/char-budgeted
 // XML `<memory-context>` block suitable for per-turn ephemeral injection without
@@ -204,27 +245,39 @@ func (b *EphemeralPackBuilder) Build(citations []MemoryCitation) string {
 	return "<memory-context>\n" + body.String() + "\n</memory-context>"
 }
 
-// ToolOutcomeSummary holds structured metadata for a 1-line argument-free tool
-// outcome summary suitable for episodic or session memory.
-type ToolOutcomeSummary struct {
-	ToolName string `json:"tool_name"`
-	CallID   string `json:"call_id"`
-	Status   string `json:"status"`
-	Summary  string `json:"summary"`
+// DefaultOutcomeSummarizer produces argument-free 1-line tool outcome summaries
+// bounded to MaxLen runes.
+type DefaultOutcomeSummarizer struct {
+	// MaxLen is the maximum rune length of the summary tail. Non-positive values
+	// fall back to DefaultToolOutcomeSummaryMaxLen.
+	MaxLen int
 }
 
-// NewToolOutcomeSummary builds a structured ToolOutcomeSummary without raw tool arguments.
-func NewToolOutcomeSummary(toolName, callID string, isError bool, rawPreview string, maxLen int) ToolOutcomeSummary {
+// NewDefaultOutcomeSummarizer constructs a DefaultOutcomeSummarizer with maxLen.
+func NewDefaultOutcomeSummarizer(maxLen int) *DefaultOutcomeSummarizer {
+	if maxLen <= 0 {
+		maxLen = DefaultToolOutcomeSummaryMaxLen
+	}
+	return &DefaultOutcomeSummarizer{MaxLen: maxLen}
+}
+
+func (s *DefaultOutcomeSummarizer) effectiveMaxLen() int {
+	if s == nil || s.MaxLen <= 0 {
+		return DefaultToolOutcomeSummaryMaxLen
+	}
+	return s.MaxLen
+}
+
+// Summarize implements OutcomeSummarizer by constructing a structured ToolOutcomeSummary
+// without raw tool arguments.
+func (s *DefaultOutcomeSummarizer) Summarize(toolName, callID string, isError bool, rawPreview string) ToolOutcomeSummary {
 	name := sanitizeToken(toolName, "unknown")
 	id := sanitizeToken(callID, "none")
 	status := "ok"
 	if isError {
 		status = "error"
 	}
-	if maxLen <= 0 {
-		maxLen = DefaultToolOutcomeSummaryMaxLen
-	}
-	summary := truncateRunes(sanitizeSingleLine(rawPreview), maxLen)
+	summary := truncateRunes(sanitizeSingleLine(rawPreview), s.effectiveMaxLen())
 	if summary == "" {
 		summary = status
 	}
@@ -236,24 +289,24 @@ func NewToolOutcomeSummary(toolName, callID string, isError bool, rawPreview str
 	}
 }
 
-// String renders the 1-line argument-free tool outcome summary:
-// `[tool_outcome] tool=<name> id=<callID> status=<ok|error> summary=...`
-func (t ToolOutcomeSummary) String() string {
-	name := sanitizeToken(t.ToolName, "unknown")
-	id := sanitizeToken(t.CallID, "none")
-	status := sanitizeToken(t.Status, "ok")
-	summary := sanitizeSingleLine(t.Summary)
-	if summary == "" {
-		summary = status
-	}
-	return fmt.Sprintf("[tool_outcome] tool=%s id=%s status=%s summary=%s", name, id, status, summary)
+// Format implements OutcomeSummarizer by rendering the 1-line outcome string.
+func (s *DefaultOutcomeSummarizer) Format(toolName, callID string, isError bool, rawPreview string) string {
+	return s.Summarize(toolName, callID, isError, rawPreview).String()
 }
 
-// SummarizeToolOutcome produces a 1-line argument-free outcome summary
-// (`[tool_outcome] tool=<name> id=<callID> status=<ok|error> summary=...`)
-// suitable for episodic/session memory without persisting raw tool arguments.
+// BuildEphemeralPack is a convenience wrapper delegating to EphemeralPackBuilder.BuildEntries.
+func BuildEphemeralPack(entries []*Entry, maxTokens, maxChars int) string {
+	return NewEphemeralPackBuilder(maxTokens, maxChars).BuildEntries(entries)
+}
+
+// NewToolOutcomeSummary is a convenience wrapper delegating to DefaultOutcomeSummarizer.Summarize.
+func NewToolOutcomeSummary(toolName, callID string, isError bool, rawPreview string, maxLen int) ToolOutcomeSummary {
+	return NewDefaultOutcomeSummarizer(maxLen).Summarize(toolName, callID, isError, rawPreview)
+}
+
+// SummarizeToolOutcome is a convenience wrapper delegating to DefaultOutcomeSummarizer.Format.
 func SummarizeToolOutcome(toolName, callID string, isError bool, rawPreview string, maxLen int) string {
-	return NewToolOutcomeSummary(toolName, callID, isError, rawPreview, maxLen).String()
+	return NewDefaultOutcomeSummarizer(maxLen).Format(toolName, callID, isError, rawPreview)
 }
 
 func sanitizeSingleLine(s string) string {

@@ -107,10 +107,11 @@ func usageTokens(v any) int {
 // store, enabling semantic keyword search from tool_search. Build one with
 // NewSemanticToolIndex and pass it to New via WithSemanticToolIndex.
 type SemanticToolIndex struct {
-	store      vectorstore.VectorStore
-	embedder   embedder.Embedder
-	cache      *EmbeddingCache
-	abstention *AbstentionConfig
+	store          vectorstore.VectorStore
+	embedder       embedder.Embedder
+	embeddingStore EmbeddingStore
+	cache          *EmbeddingCache
+	abstention     AbstentionDecider
 
 	// indexed maps a tool name to the fingerprint of its stored embedding.
 	// Keeping the fingerprint (not just a presence bit) lets upsert detect
@@ -152,6 +153,21 @@ func WithEmbeddingCache(c *EmbeddingCache) SemanticToolIndexOption {
 	return func(k *SemanticToolIndex) {
 		if c != nil {
 			k.cache = c
+			k.embeddingStore = c
+		}
+	}
+}
+
+// WithEmbeddingStore sets a custom EmbeddingStore port on the SemanticToolIndex.
+func WithEmbeddingStore(s EmbeddingStore) SemanticToolIndexOption {
+	return func(k *SemanticToolIndex) {
+		if s != nil {
+			k.embeddingStore = s
+			if c, ok := s.(*EmbeddingCache); ok {
+				k.cache = c
+			} else {
+				k.cache = nil
+			}
 		}
 	}
 }
@@ -164,7 +180,17 @@ func WithSemanticAbstentionConfig(cfg AbstentionConfig) SemanticToolIndexOption 
 	}
 }
 
-// Cache returns the EmbeddingCache backing this SemanticToolIndex.
+// WithSemanticAbstentionDecider sets a custom AbstentionDecider on the SemanticToolIndex.
+func WithSemanticAbstentionDecider(decider AbstentionDecider) SemanticToolIndexOption {
+	return func(k *SemanticToolIndex) {
+		if decider != nil {
+			k.abstention = decider
+		}
+	}
+}
+
+// Cache returns the EmbeddingCache backing this SemanticToolIndex, or nil if a
+// non-EmbeddingCache EmbeddingStore was configured via WithEmbeddingStore.
 func (k *SemanticToolIndex) Cache() *EmbeddingCache {
 	if k == nil {
 		return nil
@@ -172,16 +198,26 @@ func (k *SemanticToolIndex) Cache() *EmbeddingCache {
 	return k.cache
 }
 
+// EmbeddingStore returns the EmbeddingStore port backing this SemanticToolIndex.
+func (k *SemanticToolIndex) EmbeddingStore() EmbeddingStore {
+	if k == nil {
+		return nil
+	}
+	return k.embeddingStore
+}
+
 // NewSemanticToolIndex creates a SemanticToolIndex backed by embedder e.
 func NewSemanticToolIndex(e embedder.Embedder, opts ...SemanticToolIndexOption) (*SemanticToolIndex, error) {
 	if e == nil {
 		return nil, fmt.Errorf("semantic tool index: embedder is nil")
 	}
+	defaultCache := NewEmbeddingCache()
 	k := &SemanticToolIndex{
-		store:    inmemory.New(),
-		embedder: e,
-		cache:    NewEmbeddingCache(),
-		indexed:  make(map[string]string),
+		store:          inmemory.New(),
+		embedder:       e,
+		embeddingStore: defaultCache,
+		cache:          defaultCache,
+		indexed:        make(map[string]string),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -225,8 +261,8 @@ func (k *SemanticToolIndex) upsert(
 			embedding []float64
 			cached    bool
 		)
-		if k.cache != nil {
-			embedding, cached = k.cache.Lookup(fp)
+		if k.embeddingStore != nil {
+			embedding, cached = k.embeddingStore.Get(fp)
 		}
 		if !cached {
 			var (
@@ -240,6 +276,8 @@ func (k *SemanticToolIndex) upsert(
 			addEmbedderUsage(usage, u)
 			if k.cache != nil {
 				k.cache.Store(name, fp, embedding)
+			} else if k.embeddingStore != nil {
+				k.embeddingStore.Put(fp, embedding)
 			}
 		} else if k.cache != nil {
 			k.cache.Store(name, fp, embedding)
@@ -450,8 +488,8 @@ func (p *Plugin) searchToolsByEmbedding(
 		return nil, nil, "", nil
 	}
 
-	abstentionCfg := p.effectiveAbstentionConfig()
-	if abstentionCfg != nil {
+	abstentionDecider := p.effectiveAbstentionDecider()
+	if abstentionDecider != nil {
 		candidates := make([]ScoredCandidate, 0, len(bestScore))
 		for name, score := range bestScore {
 			desc := ""
@@ -464,7 +502,7 @@ func (p *Plugin) searchToolsByEmbedding(
 				Description: desc,
 			})
 		}
-		decided := ApplyAbstention(candidates, req.queries, abstentionCfg)
+		decided := abstentionDecider.ApplyAbstention(candidates, req.queries)
 		if len(decided) == 0 {
 			return nil, nil, "", nil
 		}
@@ -491,11 +529,11 @@ func (p *Plugin) searchToolsByEmbedding(
 	return selected, overflow, "", nil
 }
 
-// effectiveAbstentionConfig returns the Plugin's abstentionConfig if set,
-// falling back to the SemanticToolIndex's abstention config.
-func (p *Plugin) effectiveAbstentionConfig() *AbstentionConfig {
-	if p.abstentionConfig != nil {
-		return p.abstentionConfig
+// effectiveAbstentionDecider returns the Plugin's AbstentionDecider if set,
+// falling back to the SemanticToolIndex's abstention decider.
+func (p *Plugin) effectiveAbstentionDecider() AbstentionDecider {
+	if p.abstentionDecider != nil {
+		return p.abstentionDecider
 	}
 	if p.semanticIndex != nil && p.semanticIndex.abstention != nil {
 		return p.semanticIndex.abstention

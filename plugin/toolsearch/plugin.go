@@ -87,9 +87,9 @@ type Plugin struct {
 	// embeddingFailOpen, when true, makes an embedding-search failure fall back
 	// to the built-in keyword matching instead of surfacing the error.
 	embeddingFailOpen bool
-	// abstentionConfig configures score-gap and minimum-confidence abstention
+	// abstentionDecider configures score-gap and minimum-confidence abstention
 	// and two-stage family narrowing.
-	abstentionConfig *AbstentionConfig
+	abstentionDecider AbstentionDecider
 
 	// discoveredLocks serializes appendDiscoveredTools per session via a fixed
 	// sharded mutex table (session key hashed into a shard), so concurrent
@@ -133,7 +133,7 @@ func New(presetTools []tool.Tool, opts ...Option) *Plugin {
 		invocationMode:       o.invocationMode,
 		semanticIndex:        o.semanticIndex,
 		embeddingFailOpen:    o.embeddingFailOpen,
-		abstentionConfig:     o.abstentionConfig,
+		abstentionDecider:    o.abstentionDecider,
 	}
 
 	for _, t := range presetTools {
